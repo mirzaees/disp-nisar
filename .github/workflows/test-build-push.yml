@@ -1,0 +1,57 @@
+name: Pytest, build docker image, push to GHCR
+
+on: [pull_request, push]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
+
+env:
+  # https://github.com/pytest-dev/pytest/issues/2042#issuecomment-429289164
+  PY_IGNORE_IMPORTMISMATCH: 1
+
+jobs:
+  pytest:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        dolphin:
+          - label: Latest
+            tag: "main"
+          # - label: Last Release
+          #   tag: v0.36.0
+
+      fail-fast: true
+    name: ${{ matrix.os }} • ${{ matrix.dolphin.label }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup environment
+        uses: mamba-org/setup-micromamba@v1
+        with:
+          environment-file: conda-env.yml
+          environment-name: disp-nisar-env
+          generate-run-shell: false
+          condarc: |
+            channels:
+              - conda-forge
+      - name: Install
+        run: |
+          python -m pip install "opera-utils>=0.18.1" git+https://github.com/isce-framework/dolphin@${{ matrix.dolphin.tag }}
+          pip install --no-deps .
+      - name: Install test dependencies
+        run: |
+          micromamba install -f tests/requirements.txt -c conda-forge
+      - name: Enable numba boundscheck for better error catching
+        run: |
+          echo "NUMBA_BOUNDSCHECK=1" >> $GITHUB_ENV
+      - name: Test (with numba boundscheck on)
+        run: |
+          pytest
+      # https://community.codecov.com/t/numba-jitted-methods-are-not-captured-by-codecov/2649
+      # - name: Coverage report
+      #   uses: codecov/codecov-action@v2

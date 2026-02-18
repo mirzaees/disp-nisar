@@ -1,0 +1,10 @@
+black
+flake8
+pooch
+pre-commit
+pytest
+pytest-cov
+pytest-randomly
+pytest-recording
+pytest-xdist
+ruff
