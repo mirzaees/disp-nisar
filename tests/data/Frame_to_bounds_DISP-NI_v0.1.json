@@ -111133,11 +111133,11 @@
         "track_number": 64,
         "orbit_pass": "Ascending",
         "land_ocean_flag": "water",
-        "epsg": 32748,
-        "xmin": 499979,
-        "xmax": 922854,
-        "ymin": 5390200,
-        "ymax": 5590724
+        "epsg": 32611,
+        "xmin": -5.0,
+        "xmax": 4.0,
+        "ymin": -1.5,
+        "ymax": 2.5
     },
     "11115": {
         "track_number": 64,
@@ -232093,11 +232093,11 @@
         "track_number": 134,
         "orbit_pass": "Descending",
         "land_ocean_flag": "water/land",
-        "epsg": 32631,
-        "xmin": 397394,
-        "xmax": 839576,
-        "ymin": 3985374,
-        "ymax": 4206435
+        "epsg": 32611,
+        "xmin": 337200,
+        "xmax": 347200,
+        "ymin": 3887000,
+        "ymax": 3892000
     },
     "23211": {
         "track_number": 134,
