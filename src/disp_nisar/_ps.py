@@ -101,6 +101,7 @@ def run_frame_ps(cfg: DisplacementWorkflow) -> tuple[Path, Path]:
             amp_dispersion_threshold=cfg.ps_options.amp_dispersion_threshold,
             nodata_mask=nodata_mask,
             block_shape=cfg.worker_settings.block_shape,
+            num_parallel=cfg.worker_settings.n_parallel_bursts,
         )
         # Remove the actual PS mask, since we're going to redo after combining
         cfg.ps_options._output_file.unlink()

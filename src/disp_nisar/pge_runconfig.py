@@ -20,7 +20,7 @@ from dolphin.workflows.config import (
     PsOptions,
     TimeseriesOptions,
     UnwrapOptions,
-    WorkerSettings,
+    WorkerSettings as DolphinWorkerSettings,
     YamlModel,
 )
 from dolphin.workflows.config._common import _read_file_list_or_glob
@@ -64,6 +64,35 @@ from ._utils import _frequency_to_wavelength, get_nisar_frame_bbox
 from .enums import ImagingFrequency, Polarization, ProcessingMode
 
 logger = logging.getLogger(__name__)
+
+
+class WorkerSettings(DolphinWorkerSettings):
+    """NISAR-specific worker settings that accepts num_parallel_workers.
+
+    This extends dolphin's WorkerSettings to accept NISAR-friendly parameter names
+    while maintaining compatibility with dolphin's internal n_parallel_bursts field.
+    """
+
+    num_parallel_workers: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Number of parallel workers for PS detection and phase linking. "
+            "For NISAR (single frame): all workers process blocks in parallel. "
+            "This parameter maps to 'n_parallel_bursts' internally for dolphin compatibility."
+        ),
+    )
+
+    # Override parent's extra="forbid" to allow num_parallel_workers field
+    model_config = ConfigDict(extra="allow")
+
+    def model_post_init(self, __context):
+        """After initialization, copy num_parallel_workers to n_parallel_bursts if provided."""
+        super().model_post_init(__context)
+        if self.num_parallel_workers is not None:
+            # User provided num_parallel_workers, use it
+            self.n_parallel_bursts = self.num_parallel_workers
+        # If num_parallel_workers not provided, n_parallel_bursts keeps its default (1)
 
 
 class InputFileGroup(YamlModel):
