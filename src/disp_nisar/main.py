@@ -420,7 +420,7 @@ def _assert_no_duplicate_dates(input_file_list: Sequence[Path]) -> None:
     # Use a set to check for duplicate dates
     if len(sensing_date_list) > len(set(sensing_date_list)):
         msg = "Duplicate dates passed:\n"
-        file_string = "\n".join(sensing_date_list)
+        file_string = "\n".join(str(d) for d in sensing_date_list)
         msg += file_string
         raise ValueError(msg)
 

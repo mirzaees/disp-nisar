@@ -83,9 +83,6 @@ class WorkerSettings(DolphinWorkerSettings):
         ),
     )
 
-    # Override parent's extra="forbid" to allow num_parallel_workers field
-    model_config = ConfigDict(extra="allow")
-
     def model_post_init(self, __context):
         """After initialization, copy num_parallel_workers to n_parallel_bursts if provided."""
         super().model_post_init(__context)

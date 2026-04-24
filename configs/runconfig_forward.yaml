@@ -75,10 +75,11 @@ worker_settings:
   #   each python process.
   #   Type: integer.
   threads_per_worker: 2
-  # If processing separate spatial bursts, number of bursts to run in parallel for wrapped-
-  #   phase-estimation.
+  # Number of parallel workers for PS detection and phase linking.
+  # For NISAR (single frame): all workers process blocks in parallel within the frame.
+  # Increase to use more CPU cores. Recommended: 50-75% of available cores.
   #   Type: integer.
-  n_parallel_bursts: 1
+  num_parallel_workers: 1
   # Size (rows, columns) of blocks of data to load at a time.
   #   Type: array.
   block_shape:
