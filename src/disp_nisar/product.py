@@ -30,6 +30,13 @@ from opera_utils import (
     parse_filename,
 )
 
+try:
+    from osgeo import gdal
+
+    HAS_GDAL = True
+except ImportError:
+    HAS_GDAL = False
+
 from . import __version__ as disp_nisar_version
 from ._baselines import _interpolate_data, compute_baselines
 from ._common import DATETIME_FORMAT, NISAR_DATASET_NAME, NISAR_IDENTIFICATION_GROUP
@@ -1533,10 +1540,30 @@ def _create_metadata_group(
 
 
 def _get_orbit_direction(cslc_filename: Filename) -> Literal["ascending", "descending"]:
-    with h5py.File(cslc_filename) as hf:
-        out = hf["/identification/orbit_pass_direction"][()]
+    filename_str = str(cslc_filename)
+    if filename_str.startswith("/vsi"):
+        # Use GDAL for VSI paths
+        if not HAS_GDAL:
+            msg = "GDAL is required to read VSI paths but is not installed"
+            raise ImportError(msg)
+
+        ds = gdal.Open(
+            f"HDF5:{filename_str}:/identification/orbit_pass_direction",
+            gdal.GA_ReadOnly,
+        )
+        if ds is None:
+            msg = f"Could not read orbit_pass_direction from {cslc_filename}"
+            raise ValueError(msg)
+        out = ds.ReadAsArray().item()
         if isinstance(out, bytes):
             out = out.decode("utf-8")
+        ds = None
+    else:
+        # Use h5py for local files
+        with h5py.File(cslc_filename) as hf:
+            out = hf["/identification/orbit_pass_direction"][()]
+            if isinstance(out, bytes):
+                out = out.decode("utf-8")
     return out
 
 
@@ -1556,10 +1583,31 @@ def _get_orbit_type(
         "MOE": "Medium precision Orbit Ephemeris",
         "DOE": "custom",
     }
-    with h5py.File(cslc_filename) as hf:
-        out = hf["/science/LSAR/GSLC/metadata/orbit/orbitType"][()]
+
+    filename_str = str(cslc_filename)
+    if filename_str.startswith("/vsi"):
+        # Use GDAL for VSI paths
+        if not HAS_GDAL:
+            msg = "GDAL is required to read VSI paths but is not installed"
+            raise ImportError(msg)
+
+        ds = gdal.Open(
+            f"HDF5:{filename_str}:/science/LSAR/GSLC/metadata/orbit/orbitType",
+            gdal.GA_ReadOnly,
+        )
+        if ds is None:
+            msg = f"Could not read orbitType from {cslc_filename}"
+            raise ValueError(msg)
+        out = ds.ReadAsArray().item()
         if isinstance(out, bytes):
             out = out.decode("utf-8")
+        ds = None
+    else:
+        # Use h5py for local files
+        with h5py.File(cslc_filename) as hf:
+            out = hf["/science/LSAR/GSLC/metadata/orbit/orbitType"][()]
+            if isinstance(out, bytes):
+                out = out.decode("utf-8")
 
     # Use cast to explicitly tell the type checker the return value is a Literal
     return cast(

@@ -14,6 +14,13 @@ from opera_utils import get_dates
 from opera_utils._utils import format_nc_filename
 from opera_utils.stitching import warp_to_match
 
+try:
+    from osgeo import gdal
+
+    HAS_GDAL = True
+except ImportError:
+    HAS_GDAL = False
+
 logger = logging.getLogger(__name__)
 
 # NISAR GUNW HDF5 paths
@@ -22,6 +29,42 @@ GUNW_IONO_PATH_TEMPLATE = (
     "{polarization}/ionospherePhaseScreen"
 )
 GUNW_IDENTIFICATION_PATH = "/science/LSAR/identification"
+
+
+def _read_hdf5_dataset(filename: Path, dataset_path: str) -> np.ndarray:
+    """Read HDF5 dataset handling both local and VSI paths.
+
+    Parameters
+    ----------
+    filename : Path
+        Path to HDF5 file (can be VSI path).
+    dataset_path : str
+        HDF5 dataset path.
+
+    Returns
+    -------
+    np.ndarray
+        Dataset values.
+
+    """
+    filename_str = str(filename)
+    if filename_str.startswith("/vsi"):
+        # Use GDAL for VSI paths
+        if not HAS_GDAL:
+            msg = "GDAL is required to read VSI paths but is not installed"
+            raise ImportError(msg)
+
+        ds = gdal.Open(f"HDF5:{filename_str}:{dataset_path}", gdal.GA_ReadOnly)
+        if ds is None:
+            msg = f"Could not open {dataset_path} from {filename_str}"
+            raise ValueError(msg)
+        arr = ds.ReadAsArray()
+        ds = None
+        return arr
+    else:
+        # Use h5py for local files
+        with h5py.File(filename, "r") as f:
+            return f[dataset_path][:]
 
 
 def get_gunw_dates(gunw_file: Path) -> tuple:
@@ -38,11 +81,46 @@ def get_gunw_dates(gunw_file: Path) -> tuple:
         (reference_datetime, secondary_datetime) tuple.
 
     """
-    with h5py.File(gunw_file, "r") as f:
-        id_group = f[GUNW_IDENTIFICATION_PATH]
-        # NISAR GUNW stores dates in identification group
-        ref_date = id_group["referenceZeroDopplerStartTime"][()].decode()
-        sec_date = id_group["secondaryZeroDopplerStartTime"][()].decode()
+    gunw_str = str(gunw_file)
+    if gunw_str.startswith("/vsi"):
+        # Use GDAL for VSI paths
+        if not HAS_GDAL:
+            msg = "GDAL is required to read VSI paths but is not installed"
+            raise ImportError(msg)
+
+        # Read reference date
+        ref_ds = gdal.Open(
+            f"HDF5:{gunw_str}:{GUNW_IDENTIFICATION_PATH}/referenceZeroDopplerStartTime",
+            gdal.GA_ReadOnly,
+        )
+        if ref_ds is None:
+            msg = f"Could not read reference date from {gunw_file}"
+            raise ValueError(msg)
+        ref_date = ref_ds.ReadAsArray().item()
+        if isinstance(ref_date, bytes):
+            ref_date = ref_date.decode()
+        ref_ds = None
+
+        # Read secondary date
+        sec_ds = gdal.Open(
+            f"HDF5:{gunw_str}:{GUNW_IDENTIFICATION_PATH}/secondaryZeroDopplerStartTime",
+            gdal.GA_ReadOnly,
+        )
+        if sec_ds is None:
+            msg = f"Could not read secondary date from {gunw_file}"
+            raise ValueError(msg)
+        sec_date = sec_ds.ReadAsArray().item()
+        if isinstance(sec_date, bytes):
+            sec_date = sec_date.decode()
+        sec_ds = None
+    else:
+        # Use h5py for local files
+        with h5py.File(gunw_file, "r") as f:
+            id_group = f[GUNW_IDENTIFICATION_PATH]
+            # NISAR GUNW stores dates in identification group
+            ref_date = id_group["referenceZeroDopplerStartTime"][()].decode()
+            sec_date = id_group["secondaryZeroDopplerStartTime"][()].decode()
+
     return date.fromisoformat(ref_date[:10]), date.fromisoformat(sec_date[:10])
 
 
@@ -74,16 +152,48 @@ def read_ionosphere_from_gunw(
     iono_path = GUNW_IONO_PATH_TEMPLATE.format(
         frequency=frequency, polarization=polarization
     )
-    with h5py.File(gunw_file, "r") as f:
-        if iono_path not in f:
+
+    gunw_str = str(gunw_file)
+    if gunw_str.startswith("/vsi"):
+        # Use GDAL for VSI paths
+        if not HAS_GDAL:
+            msg = "GDAL is required to read VSI paths but is not installed"
+            raise ImportError(msg)
+
+        ds = gdal.Open(f"HDF5:{gunw_str}:{iono_path}", gdal.GA_ReadOnly)
+        if ds is None:
             logger.warning(
                 f"Ionosphere dataset not found at {iono_path} in {gunw_file}"
             )
             return None
+
+        band = ds.GetRasterBand(1)
         if row_slice is not None:
-            iono_data = f[iono_path][row_slice, :].astype(np.float32)
+            # Read specific rows using GDAL windowing
+            ysize = ds.RasterYSize
+            xsize = ds.RasterXSize
+            # Convert slice to start/count
+            start = row_slice.start or 0
+            stop = row_slice.stop or ysize
+            iono_data = band.ReadAsArray(0, start, xsize, stop - start).astype(
+                np.float32
+            )
         else:
-            iono_data = f[iono_path][()].astype(np.float32)
+            iono_data = band.ReadAsArray().astype(np.float32)
+        ds = None
+    else:
+        # Use h5py for local files
+        with h5py.File(gunw_file, "r") as f:
+            if iono_path not in f:
+                logger.warning(
+                    f"Ionosphere dataset not found at {iono_path} in {gunw_file}"
+                )
+                return None
+            if row_slice is not None:
+                iono_data = f[iono_path][row_slice, :].astype(np.float32)
+            else:
+                iono_data = f[iono_path][()].astype(np.float32)
+
     return iono_data
 
 
@@ -292,13 +402,29 @@ def read_ionosphere_phase_screen(
     for gunw_file in sorted(gunw_files):
         try:
             ref_date, sec_date = get_gunw_dates(gunw_file)
-            with h5py.File(gunw_file, "r") as f:
-                if iono_path not in f:
+
+            # Handle VSI paths differently (h5py doesn't support them)
+            if str(gunw_file).startswith("/vsi"):
+                from osgeo import gdal
+
+                gunw_str = str(gunw_file)
+                ds = gdal.Open(f"NETCDF:{gunw_str}:{iono_path}", gdal.GA_ReadOnly)
+                if ds is None:
                     logger.warning(
                         f"Ionosphere path not found in {gunw_file}, skipping"
                     )
                     continue
-                shape = f[iono_path].shape
+                shape = (ds.RasterYSize, ds.RasterXSize)
+                ds = None
+            else:
+                # Use h5py for local files
+                with h5py.File(gunw_file, "r") as f:
+                    if iono_path not in f:
+                        logger.warning(
+                            f"Ionosphere path not found in {gunw_file}, skipping"
+                        )
+                        continue
+                    shape = f[iono_path].shape
             if iono_shape is None:
                 iono_shape = shape
             elif shape != iono_shape:

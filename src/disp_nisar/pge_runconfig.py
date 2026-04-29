@@ -20,8 +20,10 @@ from dolphin.workflows.config import (
     PsOptions,
     TimeseriesOptions,
     UnwrapOptions,
-    WorkerSettings as DolphinWorkerSettings,
     YamlModel,
+)
+from dolphin.workflows.config import (
+    WorkerSettings as DolphinWorkerSettings,
 )
 from dolphin.workflows.config._common import _read_file_list_or_glob
 from opera_utils import (
@@ -77,14 +79,14 @@ class WorkerSettings(DolphinWorkerSettings):
         default=None,
         ge=1,
         description=(
-            "Number of parallel workers for PS detection and phase linking. "
-            "For NISAR (single frame): all workers process blocks in parallel. "
-            "This parameter maps to 'n_parallel_bursts' internally for dolphin compatibility."
+            "Number of parallel workers for PS detection and phase linking. For NISAR"
+            " (single frame): all workers process blocks in parallel. This parameter"
+            " maps to 'n_parallel_bursts' internally for dolphin compatibility."
         ),
     )
 
-    def model_post_init(self, __context):
-        """After initialization, copy num_parallel_workers to n_parallel_bursts if provided."""
+    def model_post_init(self, __context, /):
+        """Copy num_parallel_workers to n_parallel_bursts if provided."""
         super().model_post_init(__context)
         if self.num_parallel_workers is not None:
             # User provided num_parallel_workers, use it
