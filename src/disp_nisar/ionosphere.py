@@ -407,8 +407,8 @@ def read_ionosphere_phase_screen(
             if str(gunw_file).startswith("/vsi"):
                 from osgeo import gdal
 
-                gunw_str = str(gunw_file)
-                ds = gdal.Open(f"NETCDF:{gunw_str}:{iono_path}", gdal.GA_ReadOnly)
+                gunw_str = format_nc_filename(gunw_file, iono_path)
+                ds = gdal.Open(gunw_str, gdal.GA_ReadOnly)
                 if ds is None:
                     logger.warning(
                         f"Ionosphere path not found in {gunw_file}, skipping"
