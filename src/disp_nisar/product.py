@@ -1548,7 +1548,7 @@ def _get_orbit_direction(cslc_filename: Filename) -> Literal["ascending", "desce
             raise ImportError(msg)
 
         ds = gdal.Open(
-            f"HDF5:{filename_str}:/identification/orbit_pass_direction",
+            f"NETCDF:{filename_str}:/identification/orbit_pass_direction",
             gdal.GA_ReadOnly,
         )
         if ds is None:
@@ -1592,7 +1592,7 @@ def _get_orbit_type(
             raise ImportError(msg)
 
         ds = gdal.Open(
-            f"HDF5:{filename_str}:/science/LSAR/GSLC/metadata/orbit/orbitType",
+            f"NETCDF:{filename_str}:/science/LSAR/GSLC/metadata/orbit/orbitType",
             gdal.GA_ReadOnly,
         )
         if ds is None:

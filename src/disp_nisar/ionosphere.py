@@ -54,7 +54,7 @@ def _read_hdf5_dataset(filename: Path, dataset_path: str) -> np.ndarray:
             msg = "GDAL is required to read VSI paths but is not installed"
             raise ImportError(msg)
 
-        ds = gdal.Open(f"HDF5:{filename_str}:{dataset_path}", gdal.GA_ReadOnly)
+        ds = gdal.Open(f"NETCDF:{filename_str}:{dataset_path}", gdal.GA_ReadOnly)
         if ds is None:
             msg = f"Could not open {dataset_path} from {filename_str}"
             raise ValueError(msg)
@@ -90,7 +90,7 @@ def get_gunw_dates(gunw_file: Path) -> tuple:
 
         # Read reference date
         ref_ds = gdal.Open(
-            f"HDF5:{gunw_str}:{GUNW_IDENTIFICATION_PATH}/referenceZeroDopplerStartTime",
+            f"NETCDF:{gunw_str}:{GUNW_IDENTIFICATION_PATH}/referenceZeroDopplerStartTime",
             gdal.GA_ReadOnly,
         )
         if ref_ds is None:
@@ -103,7 +103,7 @@ def get_gunw_dates(gunw_file: Path) -> tuple:
 
         # Read secondary date
         sec_ds = gdal.Open(
-            f"HDF5:{gunw_str}:{GUNW_IDENTIFICATION_PATH}/secondaryZeroDopplerStartTime",
+            f"NETCDF:{gunw_str}:{GUNW_IDENTIFICATION_PATH}/secondaryZeroDopplerStartTime",
             gdal.GA_ReadOnly,
         )
         if sec_ds is None:
@@ -160,7 +160,7 @@ def read_ionosphere_from_gunw(
             msg = "GDAL is required to read VSI paths but is not installed"
             raise ImportError(msg)
 
-        ds = gdal.Open(f"HDF5:{gunw_str}:{iono_path}", gdal.GA_ReadOnly)
+        ds = gdal.Open(f"NETCDF:{gunw_str}:{iono_path}", gdal.GA_ReadOnly)
         if ds is None:
             logger.warning(
                 f"Ionosphere dataset not found at {iono_path} in {gunw_file}"
