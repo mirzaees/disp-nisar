@@ -30,6 +30,9 @@ Compute vertical velocity with custom incidence angle:
 Save all outputs (velocity, R-squared, and intercept):
     $ python displacement_to_velocity.py disp_*_*.nc -o velocity.tif --save-intercept -v
 
+Use more workers for faster processing:
+    $ python displacement_to_velocity.py disp_*_*.nc -o velocity.tif --workers 16
+
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ from __future__ import annotations
 import argparse
 import logging
 from datetime import datetime
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Sequence
 
@@ -116,6 +120,12 @@ def parse_args() -> argparse.Namespace:
         "--save-intercept",
         action="store_true",
         help="Save intercept from linear fit to separate GeoTIFF",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: number of CPUs)",
     )
     parser.add_argument(
         "-v",
@@ -362,10 +372,48 @@ def convert_los_to_vertical(
     return vertical_velocity
 
 
+def _process_pixel_batch(args):
+    """Process a batch of pixels for parallel computation.
+
+    Parameters
+    ----------
+    args : tuple
+        (pixel_indices, disp_2d, valid_mask, times, min_observations)
+
+    Returns
+    -------
+    results : list
+        List of tuples (pixel_idx, velocity, intercept, r_squared)
+
+    """
+    pixel_indices, disp_2d, valid_mask, times, min_observations = args
+    results = []
+
+    for i in pixel_indices:
+        # Get valid data for this pixel
+        mask = valid_mask[:, i]
+        y = disp_2d[mask, i]
+        x = times[mask]
+
+        if len(x) < min_observations:
+            continue
+
+        # Linear regression: y = slope * x + intercept
+        slope, intercept_val, r_value, _, _ = stats.linregress(x, y)
+
+        # Convert slope from meters/day to meters/year
+        velocity_val = slope * 365.25
+
+        results.append((i, velocity_val, intercept_val, r_value**2))
+
+    return results
+
+
 def compute_velocity(
     displacements: NDArray[np.float32],
     times: NDArray[np.float64],
     min_observations: int = 3,
+    n_workers: int | None = None,
 ) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
     """Compute velocity from displacement time series using linear regression.
 
@@ -377,6 +425,8 @@ def compute_velocity(
         Time values in days since reference.
     min_observations : int
         Minimum number of valid observations required per pixel.
+    n_workers : int, optional
+        Number of parallel workers. If None, uses number of CPUs.
 
     Returns
     -------
@@ -390,6 +440,11 @@ def compute_velocity(
     """
     n_dates, rows, cols = displacements.shape
     logger.info(f"Computing velocity for {rows} x {cols} pixels")
+
+    if n_workers is None:
+        n_workers = cpu_count()
+
+    logger.info(f"Using {n_workers} parallel workers")
 
     # Initialize output arrays
     velocity = np.full((rows, cols), np.nan, dtype=np.float32)
@@ -405,39 +460,48 @@ def compute_velocity(
 
     # Process only pixels with enough observations
     sufficient_data = n_valid >= min_observations
-    n_pixels_processed = sufficient_data.sum()
+    valid_indices = np.where(sufficient_data)[0]
+    n_pixels_processed = len(valid_indices)
 
     logger.info(
         f"Processing {n_pixels_processed:,} pixels with >= {min_observations}"
         " observations"
     )
 
-    # Vectorized linear regression for all valid pixels
-    for i in range(disp_2d.shape[1]):
-        if not sufficient_data[i]:
-            continue
+    if n_pixels_processed == 0:
+        logger.warning("No valid pixels to process")
+        return velocity, intercept, r_squared
 
-        # Get valid data for this pixel
-        mask = valid_mask[:, i]
-        y = disp_2d[mask, i]
-        x = times[mask]
+    # Split work into chunks for parallel processing
+    chunk_size = max(1, n_pixels_processed // (n_workers * 10))
+    chunks = [
+        valid_indices[i : i + chunk_size]
+        for i in range(0, n_pixels_processed, chunk_size)
+    ]
 
-        if len(x) < min_observations:
-            continue
+    logger.info(f"Processing {len(chunks)} chunks of ~{chunk_size} pixels each")
 
-        # Linear regression: y = slope * x + intercept
-        slope, intercept_val, r_value, _, _ = stats.linregress(x, y)
+    # Prepare arguments for parallel processing
+    args_list = [
+        (chunk, disp_2d, valid_mask, times, min_observations) for chunk in chunks
+    ]
 
-        # Convert slope from meters/day to meters/year
-        velocity_val = slope * 365.25
+    # Process in parallel
+    with Pool(processes=n_workers) as pool:
+        chunk_results = pool.map(_process_pixel_batch, args_list)
 
-        # Store results
-        row_idx = i // cols
-        col_idx = i % cols
-        velocity[row_idx, col_idx] = velocity_val
-        intercept[row_idx, col_idx] = intercept_val
-        r_squared[row_idx, col_idx] = r_value**2
+    # Collect results
+    n_computed = 0
+    for results in chunk_results:
+        for i, vel, inter, r2 in results:
+            row_idx = i // cols
+            col_idx = i % cols
+            velocity[row_idx, col_idx] = vel
+            intercept[row_idx, col_idx] = inter
+            r_squared[row_idx, col_idx] = r2
+            n_computed += 1
 
+    logger.info(f"Successfully computed velocity for {n_computed:,} pixels")
     logger.info(
         f"Velocity range: {np.nanmin(velocity):.4f} to {np.nanmax(velocity):.4f} m/yr"
     )
@@ -531,6 +595,7 @@ def main() -> None:
         displacements,
         times,
         min_observations=args.min_observations,
+        n_workers=args.workers,
     )
 
     # Read geospatial metadata from first file
