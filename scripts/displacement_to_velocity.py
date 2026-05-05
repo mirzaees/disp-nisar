@@ -9,20 +9,26 @@ Optionally converts line-of-sight (LOS) velocity to vertical velocity by
 assuming all motion is vertical (zero horizontal velocity). This is a common
 approximation in InSAR analysis.
 
+Notes
+-----
+The script expects displacement filenames containing dates in YYYYMMDD format,
+with the reference date and secondary date (e.g., disp_20200101_20200113.nc).
+The reference date is automatically included as time zero with zero displacement.
+
 Examples
 --------
 Compute LOS velocity from displacement time series:
-    $ python displacement_to_velocity.py disp_*.nc -o velocity.tif
+    $ python displacement_to_velocity.py disp_*_*.nc -o velocity.tif
 
 Compute vertical velocity assuming zero horizontal motion:
-    $ python displacement_to_velocity.py disp_*.nc -o velocity.tif --vertical
+    $ python displacement_to_velocity.py disp_*_*.nc -o velocity.tif --vertical
 
 Compute vertical velocity with custom incidence angle:
-    $ python displacement_to_velocity.py disp_*.nc -o velocity.tif
+    $ python displacement_to_velocity.py disp_*_*.nc -o velocity.tif
              --vertical --incidence-angle 38.5
 
 Save all outputs (velocity, R-squared, and intercept):
-    $ python displacement_to_velocity.py disp_*.nc -o velocity.tif --save-intercept -v
+    $ python displacement_to_velocity.py disp_*_*.nc -o velocity.tif --save-intercept -v
 
 """
 
@@ -30,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -89,15 +96,6 @@ def parse_args() -> argparse.Namespace:
         help="Minimum number of valid observations required per pixel (default: 3)",
     )
     parser.add_argument(
-        "--reference-date",
-        type=str,
-        default=None,
-        help=(
-            "Reference date in ISO format (YYYY-MM-DD) to compute velocities relative"
-            " to. If not provided, uses the earliest date."
-        ),
-    )
-    parser.add_argument(
         "--vertical",
         action="store_true",
         help=(
@@ -128,10 +126,53 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_dates_from_filename(filename: Path) -> tuple[datetime, datetime]:
+    """Parse reference and secondary dates from displacement filename.
+
+    Expected format: *_refdate_secdate.nc or similar patterns with dates
+    in YYYYMMDD format.
+
+    Parameters
+    ----------
+    filename : Path
+        Path to displacement file.
+
+    Returns
+    -------
+    reference_date : datetime
+        Reference date.
+    secondary_date : datetime
+        Secondary date.
+
+    """
+    stem = filename.stem
+    # Try to find date patterns (YYYYMMDD format)
+    import re
+
+    date_pattern = r"(\d{8})"
+    dates = re.findall(date_pattern, stem)
+
+    if len(dates) < 2:
+        raise ValueError(
+            f"Could not parse reference and secondary dates from filename: {filename}. "
+            "Expected format with two dates in YYYYMMDD format."
+        )
+
+    # Assume last two dates are reference and secondary
+    ref_str, sec_str = dates[-2], dates[-1]
+    reference_date = datetime.strptime(ref_str, "%Y%m%d")
+    secondary_date = datetime.strptime(sec_str, "%Y%m%d")
+
+    return reference_date, secondary_date
+
+
 def read_displacement_stack(
     displacement_files: Sequence[Path],
-) -> tuple[NDArray[np.float32], NDArray[np.float64]]:
+) -> tuple[NDArray[np.float32], NDArray[np.float64], datetime]:
     """Read displacement data and times from multiple NetCDF files.
+
+    Parses dates from filenames, sorts by secondary date, and includes
+    reference date at time zero with zero displacement.
 
     Parameters
     ----------
@@ -142,37 +183,78 @@ def read_displacement_stack(
     -------
     displacements : NDArray[np.float32]
         Displacement data with shape (n_dates, rows, cols).
+        First layer is zeros (reference date).
     times : NDArray[np.float64]
-        Time values in days since the first acquisition.
+        Time values in days since the reference date.
+        First value is 0.0 (reference date).
+    reference_date : datetime
+        The reference date used for the time series.
 
     """
     logger.info(f"Reading {len(displacement_files)} displacement files")
 
+    # Parse dates and sort by secondary date
+    file_info = []
+    for file_path in displacement_files:
+        ref_date, sec_date = parse_dates_from_filename(file_path)
+        file_info.append((file_path, ref_date, sec_date))
+
+    # Sort by secondary date
+    file_info.sort(key=lambda x: x[2])
+
+    # Check that all files have the same reference date
+    reference_dates = [info[1] for info in file_info]
+    if len(set(reference_dates)) > 1:
+        logger.warning(
+            f"Multiple reference dates found: {set(reference_dates)}. "
+            "Using the earliest as the reference."
+        )
+        reference_date = min(reference_dates)
+    else:
+        reference_date = reference_dates[0]
+
+    logger.info(f"Reference date: {reference_date.strftime('%Y-%m-%d')}")
+
     displacements_list = []
     times_list = []
 
-    for file_path in sorted(displacement_files):
-        logger.debug(f"Reading {file_path}")
+    # Read the first file to get the shape for the zero displacement at reference
+    with h5py.File(file_info[0][0], "r") as f:
+        shape = f[DISPLACEMENT_DATASET].shape
+
+    # Add reference date with zero displacement
+    displacements_list.append(np.zeros(shape, dtype=np.float32))
+    times_list.append(0.0)
+
+    for file_path, ref_date, sec_date in file_info:
+        logger.debug(
+            f"Reading {file_path.name}: {ref_date.strftime('%Y%m%d')} -> "
+            f"{sec_date.strftime('%Y%m%d')}"
+        )
+
         with h5py.File(file_path, "r") as f:
             # Read displacement data
             disp = f[DISPLACEMENT_DATASET][:]
             displacements_list.append(disp)
 
-            # Read time (in seconds since reference_time)
-            time_seconds = f[TIME_DATASET][0]
-            times_list.append(time_seconds)
+        # Compute time in days from reference date
+        time_days = (sec_date - reference_date).total_seconds() / (24 * 3600)
+        times_list.append(time_days)
 
     # Stack into arrays
     displacements = np.stack(displacements_list, axis=0)
-    times_seconds = np.array(times_list)
-
-    # Convert times to days since first acquisition
-    times_days = (times_seconds - times_seconds.min()) / (24 * 3600)
+    times_days = np.array(times_list)
 
     logger.info(f"Loaded displacement stack: {displacements.shape}")
     logger.info(f"Time range: {times_days.min():.1f} to {times_days.max():.1f} days")
 
-    return displacements, times_days
+    # Log the time series
+    logger.info("Time series dates:")
+    logger.info(f"  {reference_date.strftime('%Y-%m-%d')}: 0.0 days (reference)")
+    for (file_path, _, sec_date), t in zip(file_info, times_days[1:]):
+        logger.info(f"  {sec_date.strftime('%Y-%m-%d')}: {t:.1f} days")
+
+    return displacements, times_days, reference_date
 
 
 def read_geotransform(displacement_file: Path) -> tuple[Affine, CRS]:
@@ -371,6 +453,7 @@ def write_geotiff(
     nodata: float = np.nan,
     description: str = "Velocity",
     units: str = "meters/year",
+    reference_date: datetime | None = None,
 ) -> None:
     """Write data to a GeoTIFF file.
 
@@ -390,6 +473,8 @@ def write_geotiff(
         Description for the band.
     units : str
         Units for the data.
+    reference_date : datetime, optional
+        Reference date for the time series.
 
     """
     rows, cols = data.shape
@@ -412,7 +497,10 @@ def write_geotiff(
     ) as dst:
         dst.write(data, 1)
         dst.set_band_description(1, description)
-        dst.update_tags(1, units=units)
+        tags = {"units": units}
+        if reference_date is not None:
+            tags["reference_date"] = reference_date.strftime("%Y-%m-%d")
+        dst.update_tags(1, **tags)
 
     logger.info(f"Wrote {output_path}")
 
@@ -436,7 +524,7 @@ def main() -> None:
             raise FileNotFoundError(f"File not found: {f}")
 
     # Read displacement stack
-    displacements, times = read_displacement_stack(args.displacement_files)
+    displacements, times, reference_date = read_displacement_stack(args.displacement_files)
 
     # Compute velocity
     velocity, intercept, r_squared = compute_velocity(
@@ -466,6 +554,7 @@ def main() -> None:
             nodata=args.nodata,
             description="Line-of-sight velocity",
             units="meters/year",
+            reference_date=reference_date,
         )
 
         # Convert to vertical
@@ -487,6 +576,7 @@ def main() -> None:
         nodata=args.nodata,
         description=velocity_description,
         units="meters/year",
+        reference_date=reference_date,
     )
 
     # Write R-squared
@@ -499,6 +589,7 @@ def main() -> None:
         nodata=args.nodata,
         description="R-squared of linear fit",
         units="unitless",
+        reference_date=reference_date,
     )
 
     # Write intercept if requested
@@ -512,6 +603,7 @@ def main() -> None:
             nodata=args.nodata,
             description="Intercept of linear fit",
             units="meters",
+            reference_date=reference_date,
         )
 
     logger.info("Velocity computation complete")
