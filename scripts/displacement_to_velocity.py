@@ -9,11 +9,16 @@ Optionally converts line-of-sight (LOS) velocity to vertical velocity by
 assuming all motion is vertical (zero horizontal velocity). This is a common
 approximation in InSAR analysis.
 
+Requirements
+------------
+- h5py, numpy, rasterio, scipy, tqdm
+
 Notes
 -----
 The script expects displacement filenames containing dates in YYYYMMDD format,
 with the reference date and secondary date (e.g., disp_20200101_20200113.nc).
 The reference date is automatically included as time zero with zero displacement.
+Progress bars show status during file reading and velocity computation.
 
 Examples
 --------
@@ -51,6 +56,7 @@ from numpy.typing import NDArray
 from rasterio.crs import CRS
 from rasterio.transform import Affine
 from scipy import stats
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -236,7 +242,9 @@ def read_displacement_stack(
     displacements_list.append(np.zeros(shape, dtype=np.float32))
     times_list.append(0.0)
 
-    for file_path, ref_date, sec_date in file_info:
+    for file_path, ref_date, sec_date in tqdm(
+        file_info, desc="Reading displacement files", unit="file"
+    ):
         logger.debug(
             f"Reading {file_path.name}: {ref_date.strftime('%Y%m%d')} -> "
             f"{sec_date.strftime('%Y%m%d')}"
@@ -488,11 +496,18 @@ def compute_velocity(
 
     # Process in parallel
     with Pool(processes=n_workers) as pool:
-        chunk_results = pool.map(_process_pixel_batch, args_list)
+        chunk_results = list(
+            tqdm(
+                pool.imap(_process_pixel_batch, args_list),
+                total=len(args_list),
+                desc="Computing velocities",
+                unit="chunk",
+            )
+        )
 
     # Collect results
     n_computed = 0
-    for results in chunk_results:
+    for results in tqdm(chunk_results, desc="Collecting results", unit="chunk"):
         for i, vel, inter, r2 in results:
             row_idx = i // cols
             col_idx = i % cols
