@@ -603,7 +603,9 @@ def main() -> None:
             raise FileNotFoundError(f"File not found: {f}")
 
     # Read displacement stack
-    displacements, times, reference_date = read_displacement_stack(args.displacement_files)
+    displacements, times, reference_date = read_displacement_stack(
+        args.displacement_files
+    )
 
     # Compute velocity
     velocity, intercept, r_squared = compute_velocity(

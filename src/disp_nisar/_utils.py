@@ -289,8 +289,123 @@ def _convert_meters_to_radians(
     return output_files
 
 
+def _extract_wkt(*candidates) -> str:
+    """Pull a WKT string out of whatever GDAL's multidim API hands back.
+
+    Handles Python str / bytes / bytearray / nested lists / numpy object
+    arrays / and attribute dicts keyed by things like `spatial_ref` or `wkt`.
+    """
+    _WKT_PREFIXES = ("PROJCS", "GEOGCS", "PROJCRS", "GEOGCRS", "COMPD_CS", "LOCAL_CS")
+
+    def _from_value(v):
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            s = v.strip().lstrip("\x00").rstrip("\x00").strip()
+            return s if s.upper().startswith(_WKT_PREFIXES) else ""
+        if isinstance(v, (bytes, bytearray)):
+            try:
+                return _from_value(bytes(v).decode("utf-8", errors="replace"))
+            except Exception:
+                return ""
+        if isinstance(v, np.ndarray):
+            # flat-iter handles 0-d, 1-d, and object dtype with one element
+            for item in v.ravel():
+                got = _from_value(item)
+                if got:
+                    return got
+            return ""
+        if isinstance(v, (list, tuple)):
+            for item in v:
+                got = _from_value(item)
+                if got:
+                    return got
+            return ""
+        return ""
+
+    for c in candidates:
+        if isinstance(c, dict):
+            for key in ("spatial_ref", "crs_wkt", "wkt", "projection", "srs"):
+                if key in c:
+                    got = _from_value(c[key])
+                    if got:
+                        return got
+            for v in c.values():
+                got = _from_value(v)
+                if got:
+                    return got
+        else:
+            got = _from_value(c)
+            if got:
+                return got
+    return ""
+
+
+def _read_nisar_grid_mdarrays(
+    path: str, frequency: str
+) -> tuple[np.ndarray, np.ndarray, float, float, int]:
+    """Read x/y coordinates, spacings, and EPSG from a NISAR GSLC via multidim API.
+
+    The `projection` MDArray holds the full WKT for the grid; EPSG is parsed
+    from that rather than read as a scalar.
+    """
+    ds = ds_grp = None
+    try:
+        ds = gdal.OpenEx(path, gdal.OF_MULTIDIM_RASTER)
+        if ds is None:
+            msg = f"Could not open {path} via multidim API"
+            raise ValueError(msg)
+        grp = ds.GetRootGroup()
+        for name in ("science", "LSAR", "GSLC", "grids", frequency):
+            grp = grp.OpenGroup(name)
+            if grp is None:
+                msg = f"Group {name!r} missing under {path}"
+                raise ValueError(msg)
+        ds_grp = grp
+
+        f64 = gdal.ExtendedDataType.Create(gdal.GDT_Float64)
+        x_coords = ds_grp.OpenMDArray("xCoordinates").ReadAsArray(buffer_datatype=f64)
+        y_coords = ds_grp.OpenMDArray("yCoordinates").ReadAsArray(buffer_datatype=f64)
+        x_spacing = float(
+            ds_grp.OpenMDArray("xCoordinateSpacing")
+            .ReadAsArray(buffer_datatype=f64)
+            .item()
+        )
+        y_spacing = float(
+            ds_grp.OpenMDArray("yCoordinateSpacing")
+            .ReadAsArray(buffer_datatype=f64)
+            .item()
+        )
+        proj_mdar = ds_grp.OpenMDArray("projection")
+        epsg = None
+        try:
+            a = proj_mdar.GetAttribute("epsg_code")
+            if a is not None:
+                val = a.Read()
+                if isinstance(val, (list, tuple)) and val:
+                    val = val[0]
+                epsg = int(val)
+        except Exception:
+            epsg = None
+        if epsg is None:
+            arr = proj_mdar.ReadAsArray()
+            if arr is not None and arr.size == 1:
+                epsg = int(arr.item())
+    finally:
+        ds_grp = ds = None
+
+    if epsg is None:
+        msg = (
+            "Could not read EPSG code from"
+            f" {path}:/science/LSAR/GSLC/grids/{frequency}/projection"
+        )
+        raise ValueError(msg)
+
+    return x_coords, y_coords, x_spacing, y_spacing, epsg
+
+
 def get_nisar_frame_bbox(
-    cslc_file: Path,
+    cslc_file: Filename,
     frequency: str = "frequencyA",
     polarization: str = "HH",  # noqa: ARG001
 ) -> tuple[int, Bbox]:
@@ -298,8 +413,10 @@ def get_nisar_frame_bbox(
 
     Parameters
     ----------
-    cslc_file : Path
-        path to the NISAR CSLC file (.h5 or .hdf5)
+    cslc_file : Filename
+        path to the NISAR CSLC file (.h5 or .hdf5). May be a VSI path
+        (e.g. /vsis3/...), in which case metadata is read via GDAL's
+        multidim API.
     frequency : str
         Frequency band to use (default: "frequencyA")
     polarization : str
@@ -315,7 +432,20 @@ def get_nisar_frame_bbox(
     ValueError: If required metadata is missing
 
     """
-    if cslc_file.suffix in {".h5", ".hdf5"}:
+    path_str = str(cslc_file)
+    suffix = Path(path_str).suffix
+
+    if path_str.startswith("/vsi"):
+        x_coords, y_coords, x_spacing, y_spacing, epsg = _read_nisar_grid_mdarrays(
+            path_str, frequency
+        )
+        bounds = (
+            float(x_coords.min()) - abs(x_spacing) / 2,
+            float(y_coords.min()) - abs(y_spacing) / 2,
+            float(x_coords.max()) + abs(x_spacing) / 2,
+            float(y_coords.max()) + abs(y_spacing) / 2,
+        )
+    elif suffix in {".h5", ".hdf5"}:
         import h5py
 
         # Read CRS and bounds directly from NISAR HDF5 metadata
