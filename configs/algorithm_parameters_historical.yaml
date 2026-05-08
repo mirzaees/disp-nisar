@@ -108,8 +108,8 @@ unwrap_options:
     # Amount of tile overlap (in pixels) along the (row, col) directions.
     #   Type: array.
     tile_overlap:
-      - 400
-      - 400
+      - 100
+      - 100
     # Number of tiles to unwrap in parallel for each interferogram.
     #   Type: integer.
     n_parallel_tiles: 7
