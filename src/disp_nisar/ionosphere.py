@@ -49,12 +49,14 @@ def _read_hdf5_dataset(filename: Path, dataset_path: str) -> np.ndarray:
     """
     filename_str = str(filename)
     if filename_str.startswith("/vsi"):
-        # Use GDAL for VSI paths
+        # Use GDAL's HDF5 driver for VSI paths (ranged S3 reads). NETCDF driver
+        # would download the whole file.
         if not HAS_GDAL:
             msg = "GDAL is required to read VSI paths but is not installed"
             raise ImportError(msg)
 
-        ds = gdal.Open(f"NETCDF:{filename_str}:{dataset_path}", gdal.GA_ReadOnly)
+        gdal_path = format_nc_filename(filename_str, dataset_path)
+        ds = gdal.Open(gdal_path, gdal.GA_ReadOnly)
         if ds is None:
             msg = f"Could not open {dataset_path} from {filename_str}"
             raise ValueError(msg)
@@ -83,36 +85,22 @@ def get_gunw_dates(gunw_file: Path) -> tuple:
     """
     gunw_str = str(gunw_file)
     if gunw_str.startswith("/vsi"):
-        # Use GDAL for VSI paths
-        if not HAS_GDAL:
-            msg = "GDAL is required to read VSI paths but is not installed"
-            raise ImportError(msg)
+        # Use GDAL's multidim API for VSI paths — string scalars can't be read
+        # with the 2D raster API, and the NETCDF driver doesn't expose /vsis3.
+        from opera_utils._cslc import _read_string_mdarray
 
-        # Read reference date
-        ref_ds = gdal.Open(
-            f"NETCDF:{gunw_str}:{GUNW_IDENTIFICATION_PATH}/referenceZeroDopplerStartTime",
-            gdal.GA_ReadOnly,
+        ref_date = _read_string_mdarray(
+            gunw_str, f"{GUNW_IDENTIFICATION_PATH}/referenceZeroDopplerStartTime"
         )
-        if ref_ds is None:
+        if ref_date is None:
             msg = f"Could not read reference date from {gunw_file}"
             raise ValueError(msg)
-        ref_date = ref_ds.ReadAsArray().item()
-        if isinstance(ref_date, bytes):
-            ref_date = ref_date.decode()
-        ref_ds = None
-
-        # Read secondary date
-        sec_ds = gdal.Open(
-            f"NETCDF:{gunw_str}:{GUNW_IDENTIFICATION_PATH}/secondaryZeroDopplerStartTime",
-            gdal.GA_ReadOnly,
+        sec_date = _read_string_mdarray(
+            gunw_str, f"{GUNW_IDENTIFICATION_PATH}/secondaryZeroDopplerStartTime"
         )
-        if sec_ds is None:
+        if sec_date is None:
             msg = f"Could not read secondary date from {gunw_file}"
             raise ValueError(msg)
-        sec_date = sec_ds.ReadAsArray().item()
-        if isinstance(sec_date, bytes):
-            sec_date = sec_date.decode()
-        sec_ds = None
     else:
         # Use h5py for local files
         with h5py.File(gunw_file, "r") as f:
