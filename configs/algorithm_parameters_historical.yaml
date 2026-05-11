@@ -325,3 +325,27 @@ forward_mode_network_size: 3
 # Number of output products to create in parallel.
 #   Type: integer.
 num_parallel_products: 4
+azimuth_blocks:
+  # Number of azimuth blocks to split the frame into for phase linking. 1 disables
+  #   the split and runs the full frame in one shot (backward-compatible default).
+  #   When > 1, the blocks run sequentially inside the same process with a memory
+  #   cleanup pass between them, so a single Batch job can process the whole frame.
+  #   Type: integer.
+  num_blocks: 1
+  # Execution-mode selector. Empty/null runs every block in this process then
+  #   assembles + unwraps + TS + products. An integer in [0, num_blocks) runs only
+  #   that block and writes its per-block outputs under `shard_dir/block_k/`
+  #   (batch worker mode). -1 skips phase linking, assumes shards already exist
+  #   in `shard_dir`, and runs the rest (batch finalize mode).
+  #   Type: integer | null.
+  block_index:
+  # When block_index is empty, number of blocks to run in parallel inside this
+  #   process via a ProcessPoolExecutor. 1 = sequential (recommended on AWS Batch
+  #   to avoid oversubscription and bounded memory use).
+  #   Type: integer.
+  n_parallel_blocks: 1
+  # Directory to write/read per-block phase-linking outputs. Empty/null defaults to
+  #   `<scratch>/blocks/`. Set to a shared path only when coordinating across
+  #   separate processes (e.g. external batch worker/finalize orchestration).
+  #   Type: string | null.
+  shard_dir:
