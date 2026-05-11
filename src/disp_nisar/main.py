@@ -21,6 +21,17 @@ from dolphin.workflows.displacement import run as run_displacement
 from opera_utils import get_dates, group_by_date
 
 from disp_nisar import __version__, product
+from disp_nisar._azimuth_blocks import (
+    _run_phase_linking_blocks,
+    assemble_full_frame,
+    build_frame_nodata_mask,
+    compute_block_windows,
+    load_block_outputs_from_shards,
+    load_grid_from_nisar_gslc,
+    resolve_overlap,
+    run_full_frame_unwrap_and_timeseries,
+    run_phase_linking_block,
+)
 from disp_nisar._masking import (
     create_mask_from_distance,  # , create_layover_shadow_masks
 )
@@ -123,9 +134,30 @@ def run(
         # Drop the PS threshold to a conservative number to avoid false positives
         cfg.ps_options.amp_dispersion_threshold = 0.15
 
-    # Run dolphin's displacement workflow
-    # Note: For NISAR, there's no stitching needed since it's one huge frame
-    out_paths = run_displacement(cfg=cfg, debug=debug)
+    # Run dolphin's displacement workflow, optionally split into azimuth blocks.
+    algorithm_parameters = AlgorithmParameters.from_yaml(
+        pge_runconfig.dynamic_ancillary_file_group.algorithm_parameters_file
+    )
+    az_opts = algorithm_parameters.azimuth_blocks
+
+    if az_opts.num_blocks <= 1:
+        # Single-shot full-frame path (backward compatible).
+        out_paths = run_displacement(cfg=cfg, debug=debug)
+    else:
+        out_paths = _run_azimuth_blocked(
+            cfg=cfg,
+            pge_runconfig=pge_runconfig,
+            az_opts=az_opts,
+            debug=debug,
+        )
+        if out_paths is None:
+            # Batch worker mode: shards were written, no further stages run.
+            logger.info(
+                "Azimuth block worker finished (block_index=%s); exiting before"
+                " unwrap/timeseries/products.",
+                az_opts.block_index,
+            )
+            return
 
     assert out_paths.timeseries_paths is not None
     assert out_paths.timeseries_residual_paths is not None
@@ -179,6 +211,109 @@ def run(
     logger.info(f"Maximum memory usage: {max_mem:.2f} GB")
     logger.info(f"Config file dolphin version: {cfg._dolphin_version}")
     logger.info(f"Current running disp_nisar version: {__version__}")
+
+
+def _run_azimuth_blocked(
+    cfg: DisplacementWorkflow,
+    pge_runconfig: RunConfig,
+    az_opts,
+    debug: bool,
+):
+    """Orchestrate the azimuth-block split.
+
+    Returns a full-frame `OutputPaths` ready for `create_products`, or `None`
+    if this process is a batch worker that should exit after writing shards.
+    """
+    # Read the authoritative native raster grid from the first *non-compressed*
+    # GSLC. Compressed SLCs from prior ministacks can have different raster
+    # dimensions; using one of those here misaligns block windows from the
+    # frame nodata mask (which is built from non-compressed inputs) and breaks
+    # combine_mask_files. EPSG comes from the frame config — NISAR GSLC WKTs
+    # can lack an AUTHORITY tag, defeating AutoIdentifyEPSG.
+    _first_non_compressed = next(
+        (f for f in cfg.cslc_file_list if "compressed" not in str(f).lower()),
+        None,
+    )
+    if _first_non_compressed is None:
+        raise ValueError(
+            "cfg.cslc_file_list contains only compressed SLCs; need at least"
+            " one non-compressed GSLC to determine the frame grid"
+        )
+    frame = load_grid_from_nisar_gslc(
+        _first_non_compressed,
+        subdataset=cfg.input_options.subdataset,
+        epsg=int(cfg.output_options.bounds_epsg or cfg.output_options.epsg),
+    )
+    overlap = resolve_overlap(cfg)
+    blocks = compute_block_windows(
+        total_rows=frame.rows, num_blocks=az_opts.num_blocks, overlap=overlap
+    )
+    shard_dir = Path(az_opts.shard_dir or cfg.work_directory / "blocks")
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "Azimuth-block split: %d blocks over %d rows, halo=%d, shard_dir=%s",
+        len(blocks),
+        frame.rows,
+        overlap,
+        shard_dir,
+    )
+
+    # Pre-build the frame-wide nodata mask from the *original* NISAR HDF5s,
+    # BEFORE any per-block staging rewrites cfg.cslc_file_list to GTiffs that
+    # no longer carry the NISAR bounding polygon. Each block crops this to its
+    # own azimuth window.
+    frame_nodata_mask = build_frame_nodata_mask(
+        cslc_file_list=cfg.cslc_file_list,
+        subdataset=cfg.input_options.subdataset,
+        out_file=cfg.work_directory / "nodata_mask_frame.tif",
+    )
+    if frame_nodata_mask is None:
+        logger.warning(
+            "No frame nodata mask available; each block will rely on the"
+            " bounds mask alone."
+        )
+
+    block_index = az_opts.block_index
+
+    if block_index is not None and block_index >= 0:
+        # Single-block worker: run one block and stop.
+        if block_index >= len(blocks):
+            raise ValueError(
+                f"block_index={block_index} out of range for num_blocks={len(blocks)}"
+            )
+        run_phase_linking_block(
+            cfg,
+            frame,
+            blocks[block_index],
+            shard_dir,
+            debug=debug,
+            frame_nodata_mask=frame_nodata_mask,
+        )
+        return None
+
+    if block_index == -1:
+        # Finalize: expect all shards to exist.
+        block_outputs = load_block_outputs_from_shards(shard_dir, len(blocks))
+    else:
+        # Local mode: run every block in this process.
+        block_outputs = _run_phase_linking_blocks(
+            cfg=cfg,
+            frame=frame,
+            blocks=blocks,
+            shard_dir=shard_dir,
+            n_parallel=az_opts.n_parallel_blocks,
+            debug=debug,
+            frame_nodata_mask=frame_nodata_mask,
+        )
+
+    assembled_dir = cfg.work_directory / "assembled"
+    assembled = assemble_full_frame(
+        block_outputs=block_outputs,
+        blocks=blocks,
+        frame=frame,
+        out_dir=assembled_dir,
+    )
+    return run_full_frame_unwrap_and_timeseries(cfg, assembled)
 
 
 def create_products(
