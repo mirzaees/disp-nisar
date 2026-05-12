@@ -154,17 +154,54 @@ def compute_block_windows(
 
 
 def block_bounds(frame: FullFrameGrid, block: BlockWindow) -> Bbox:
-    """Translate a block's row read-window to UTM bounds.
+    """Translate a block's row read-window to projected bounds.
 
-    The x range is the full frame; only y is narrowed.
+    Transforms pixel/row indices to coordinates in the projection specified by
+    ``frame.epsg``. The x range spans the full frame; only y is narrowed to the
+    block's read window.
+
+    Uses the frame's geotransform to convert from pixel coordinates (row, col)
+    to projected coordinates (x, y):
+        x_projected = geotransform[0] + col * geotransform[1]
+        y_projected = geotransform[3] + row * geotransform[5]
+
+    For north-up rasters, geotransform[5] is negative, so:
+        y_projected = top - row * y_res
+
+    Parameters
+    ----------
+    frame : FullFrameGrid
+        Full frame grid with bounds in projected coordinates (EPSG: frame.epsg)
+    block : BlockWindow
+        Block window with row indices (0-based from top of frame)
+
+    Returns
+    -------
+    Bbox
+        Bounding box in projected coordinates (meters or degrees depending on EPSG)
     """
-    ymax_block = frame.bounds.top - block.read_start * frame.y_res
-    ymin_block = frame.bounds.top - block.read_stop * frame.y_res
+    # Get geotransform components
+    gt = frame.geotransform
+    x_origin = gt[0]  # left (westernmost X)
+    x_pixel_size = gt[1]  # pixel width
+    y_origin = gt[3]  # top (northernmost Y)
+    y_pixel_size = gt[5]  # pixel height (negative for north-up)
+
+    # Transform row indices to Y coordinates in the projection
+    # For north-up rasters: y_pixel_size is negative, so we add row * y_pixel_size
+    # which is equivalent to subtracting row * abs(y_pixel_size)
+    ymax_block = y_origin + block.read_start * y_pixel_size
+    ymin_block = y_origin + block.read_stop * y_pixel_size
+
+    # X coordinates span the full frame (columns 0 to frame.cols)
+    xmin_block = x_origin
+    xmax_block = x_origin + frame.cols * x_pixel_size
+
     return Bbox(
-        left=frame.bounds.left,
-        bottom=ymin_block,
-        right=frame.bounds.right,
-        top=ymax_block,
+        left=xmin_block,
+        bottom=min(ymin_block, ymax_block),  # bottom is smaller Y value
+        right=xmax_block,
+        top=max(ymin_block, ymax_block),  # top is larger Y value
     )
 
 
@@ -320,20 +357,34 @@ def _crop_frame_mask_to_block(
     template: Path,
     block: BlockWindow,
     out_path: Path,
+    frame: FullFrameGrid,
 ) -> Path:
-    """Crop a full-frame mask to a block's rows, matching ``template`` grid.
+    """Crop a full-frame mask to a block's rows with correct projection info.
 
-    ``template`` is one of the block's staged GTiffs — we copy its
-    geotransform and projection so the cropped mask lines up pixel-for-pixel
-    with the block's inputs. ``combine_mask_files`` requires all mask layers
-    to share a grid.
+    Extracts the block's rows from the full-frame mask and writes with a
+    geotransform computed from ``frame`` to ensure the cropped mask aligns
+    pixel-for-pixel with the block's bounds in the projected coordinate system.
 
-    Geotransform + projection are pulled explicitly rather than via
-    ``write_arr(like_filename=...)`` because complex-dtype GTiffs produced by
-    staging can trip up ``FileInfo.from_user_inputs`` when it probes the
-    template's band 1 for a nodata value (it returns ``None`` for some HDF5-
-    derived bands, raising ``AttributeError``). Passing ``geotransform``/
-    ``projection`` directly avoids that probe entirely.
+    The output geotransform is derived from the frame grid and block window,
+    ensuring consistency with the projection specified by ``frame.epsg``.
+
+    Parameters
+    ----------
+    frame_mask : Path
+        Full-frame mask file
+    template : Path
+        One of the block's staged GTiffs (used only for projection WKT)
+    block : BlockWindow
+        Block window defining which rows to extract
+    out_path : Path
+        Output path for cropped mask
+    frame : FullFrameGrid
+        Full frame grid with projection info and pixel spacing
+
+    Returns
+    -------
+    Path
+        Path to the cropped mask file
     """
     from osgeo import gdal
 
@@ -342,19 +393,32 @@ def _crop_frame_mask_to_block(
         rows=slice(block.read_start, block.read_stop),
         cols=slice(None),
     )
+
+    # Get projection WKT from template
     ds = gdal.Open(str(template))
     if ds is None:
         raise RuntimeError(f"Could not open staged template for mask crop: {template}")
     try:
-        gt = ds.GetGeoTransform()
         proj = ds.GetProjection()
     finally:
         ds = None
 
+    # Compute geotransform for the block based on frame grid
+    # The block starts at row block.read_start in the full frame
+    gt = frame.geotransform
+    block_geotransform = (
+        gt[0],  # X origin (left) - same as full frame
+        gt[1],  # X pixel size
+        gt[2],  # X rotation (typically 0)
+        gt[3] + block.read_start * gt[5],  # Y origin adjusted for block start row
+        gt[4],  # Y rotation (typically 0)
+        gt[5],  # Y pixel size (negative for north-up)
+    )
+
     io.write_arr(
         arr=arr,
         output_name=out_path,
-        geotransform=gt,
+        geotransform=block_geotransform,
         projection=proj,
         dtype=arr.dtype,
         nbands=1,
@@ -367,14 +431,34 @@ def _stage_input_to_local(
     subdataset: str | None,
     block: BlockWindow,
     out_dir: Path,
+    frame: FullFrameGrid,
 ) -> Path:
     """Extract a block's azimuth window from ``src_path`` into a local GTiff.
 
     Opens the input via GDAL's HDF5 driver (if a subdataset is given) or
     directly (for plain rasters / compressed SLCs already in GTiff form),
     then uses ``gdal.Translate`` with ``srcWin`` to write only the block's
-    rows to a local GeoTIFF. The returned path is dropped into
-    ``cfg.cslc_file_list`` for the block run.
+    rows to a local GeoTIFF. After extraction, the geotransform is updated
+    to match the frame grid exactly, ensuring consistent georeferencing across
+    all blocks.
+
+    Parameters
+    ----------
+    src_path : str
+        Path to source file (may be remote: /vsis3/..., s3://..., etc.)
+    subdataset : str | None
+        HDF5 subdataset path, if applicable
+    block : BlockWindow
+        Block window defining which rows to extract
+    out_dir : Path
+        Output directory for staged file
+    frame : FullFrameGrid
+        Full frame grid with projection info and pixel spacing
+
+    Returns
+    -------
+    Path
+        Path to the staged GTiff with correct projection information
     """
     from osgeo import gdal
 
@@ -421,6 +505,32 @@ def _stage_input_to_local(
         )
     finally:
         src_ds = None
+
+    # Update geotransform to match frame grid exactly
+    # This ensures the block's output has correct georeferencing in the
+    # projection specified by frame.epsg
+    out_ds = gdal.Open(str(out_path), gdal.GA_Update)
+    if out_ds is not None:
+        try:
+            gt = frame.geotransform
+            # Compute geotransform for this block's rows
+            block_geotransform = (
+                gt[0],  # X origin (left) - same as full frame
+                gt[1],  # X pixel size
+                gt[2],  # X rotation (typically 0)
+                gt[3] + block.read_start * gt[5],  # Y origin adjusted for block start
+                gt[4],  # Y rotation (typically 0)
+                gt[5],  # Y pixel size (negative for north-up)
+            )
+            out_ds.SetGeoTransform(block_geotransform)
+            # Also ensure projection is set (some HDF5 sources may lack it)
+            from osgeo import osr
+            srs = osr.SpatialReference()
+            srs.ImportFromEPSG(frame.epsg)
+            out_ds.SetProjection(srs.ExportToWkt())
+        finally:
+            out_ds = None
+
     return out_path
 
 
@@ -428,6 +538,7 @@ def _stage_inputs_for_block(
     cfg: DisplacementWorkflow,
     block: BlockWindow,
     staging_dir: Path,
+    frame: FullFrameGrid,
 ) -> tuple[list[Path], str | None]:
     """Stage every entry in ``cfg.cslc_file_list`` that points at remote storage.
 
@@ -436,6 +547,22 @@ def _stage_inputs_for_block(
     because the staged GTiffs carry their band directly with no HDF5 subdataset
     hierarchy — the caller must set ``block_cfg.input_options.subdataset`` to
     this value.
+
+    Parameters
+    ----------
+    cfg : DisplacementWorkflow
+        Workflow configuration
+    block : BlockWindow
+        Block window defining which rows to extract
+    staging_dir : Path
+        Directory for staged files
+    frame : FullFrameGrid
+        Full frame grid with projection info and pixel spacing
+
+    Returns
+    -------
+    tuple[list[Path], str | None]
+        Staged file paths and new subdataset value
     """
     staging_dir.mkdir(parents=True, exist_ok=True)
     subdataset = cfg.input_options.subdataset
@@ -445,7 +572,7 @@ def _stage_inputs_for_block(
         if _is_remote_path(src):
             any_staged = True
             staged.append(
-                _stage_input_to_local(str(src), subdataset, block, staging_dir)
+                _stage_input_to_local(str(src), subdataset, block, staging_dir, frame)
             )
         else:
             staged.append(Path(src))
@@ -481,7 +608,7 @@ def run_phase_linking_block(
     block_cfg = _narrow_cfg_for_block(cfg, frame, block, block_work_dir)
 
     staging_dir = block_work_dir / "staged_inputs"
-    staged_files, new_subdataset = _stage_inputs_for_block(cfg, block, staging_dir)
+    staged_files, new_subdataset = _stage_inputs_for_block(cfg, block, staging_dir, frame)
     if staged_files != list(cfg.cslc_file_list):
         logger.info(
             "Staged %d/%d inputs to %s for block %d",
@@ -499,7 +626,7 @@ def run_phase_linking_block(
             staged_files[0],
         )
         block_mask = block_work_dir / "nodata_mask_block.tif"
-        _crop_frame_mask_to_block(frame_nodata_mask, template, block, block_mask)
+        _crop_frame_mask_to_block(frame_nodata_mask, template, block, block_mask, frame)
         block_cfg.layover_shadow_mask_files = [block_mask]
         logger.info(
             "Cropped frame nodata mask to block %d window -> %s",
