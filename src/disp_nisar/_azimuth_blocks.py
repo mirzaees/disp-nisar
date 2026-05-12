@@ -292,17 +292,58 @@ def _narrow_cfg_for_block(
 
     The copy narrows `output_options.bounds` to the block's read window, disables
     unwrap and timeseries inversion (those run once on the assembled frame), and
-    redirects all scratch to ``block_work_dir``.
+    redirects PS and phase_linking outputs to ``block_work_dir``.
+
+    Only PS and phase_linking directories are redirected to the block directory.
+    interferogram_network, unwrap_options, and timeseries_options remain pointing
+    to the main work directory since those stages run on the assembled full frame.
     """
     block_cfg = copy.deepcopy(cfg)
     block_cfg.output_options.bounds = tuple(block_bounds(frame, block))
     block_cfg.unwrap_options.run_unwrap = False
     block_cfg.timeseries_options.run_inversion = False
     block_cfg.timeseries_options.run_velocity = False
+
+    # Update work directory for the block
+    old_work_dir = block_cfg.work_directory
     block_cfg.work_directory = block_work_dir
-    # The log file is anchored to work_directory in dolphin — force it so the
-    # per-block logs end up under the block dir.
+
+    # Redirect ONLY ps_options and phase_linking to block directory
+    # interferogram_network stays at main directory (interferograms assembled there)
+    for step in ["ps_options", "phase_linking"]:
+        opts = getattr(block_cfg, step)
+        # Get the relative path from the old work directory
+        try:
+            rel_dir = opts._directory.relative_to(old_work_dir)
+        except ValueError:
+            # If not relative, just use the directory name
+            rel_dir = opts._directory.name
+        # Set to block work directory
+        opts._directory = block_work_dir / rel_dir
+
+    # Update PS output file paths to block directory
+    ps_opts = block_cfg.ps_options
+    try:
+        ps_opts._output_file = block_work_dir / ps_opts._output_file.relative_to(
+            old_work_dir
+        )
+        ps_opts._amp_mean_file = block_work_dir / ps_opts._amp_mean_file.relative_to(
+            old_work_dir
+        )
+        ps_opts._amp_dispersion_file = (
+            block_work_dir / ps_opts._amp_dispersion_file.relative_to(old_work_dir)
+        )
+    except ValueError:
+        # Fallback if paths aren't relative
+        ps_opts._output_file = block_work_dir / "PS" / ps_opts._output_file.name
+        ps_opts._amp_mean_file = block_work_dir / "PS" / ps_opts._amp_mean_file.name
+        ps_opts._amp_dispersion_file = (
+            block_work_dir / "PS" / ps_opts._amp_dispersion_file.name
+        )
+
+    # The log file is anchored to work_directory in dolphin
     block_cfg.log_file = block_work_dir / "dolphin.log"
+
     return block_cfg
 
 
