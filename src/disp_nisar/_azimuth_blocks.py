@@ -33,11 +33,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, Sequence
 
-from dolphin import io
+from dolphin import interferogram, io
 from dolphin._types import Bbox
+from dolphin.workflows import wrapped_phase
 from dolphin.workflows.config import DisplacementWorkflow
 from dolphin.workflows.displacement import OutputPaths
-from dolphin.workflows.displacement import run as run_displacement
 
 logger = logging.getLogger(__name__)
 
@@ -648,7 +648,32 @@ def run_phase_linking_block(
         block.read_stop,
     )
     try:
-        return run_displacement(cfg=block_cfg, debug=debug)
+        # Run wrapped phase estimation only (no unwrapping/timeseries/stitching)
+        wrapped_output = wrapped_phase.run(cfg=block_cfg, debug=debug)
+
+        # NISAR inputs have no burst id, so use "phase_linking" as the key
+        burst_key = "phase_linking"
+
+        # Convert to OutputPaths format expected by assemble_full_frame
+        # Note: Correlation files are NOT generated at block level - they will be
+        # generated after full-frame assembly to avoid redundant computation
+        return OutputPaths(
+            comp_slc_dict={burst_key: wrapped_output.comp_slc_file_list},
+            stitched_ifg_paths=wrapped_output.ifg_file_list,
+            stitched_cor_paths=[],  # Empty - correlations generated after assembly
+            stitched_temp_coh_files=wrapped_output.temp_coh_files,
+            stitched_shp_count_files=wrapped_output.shp_count_files,
+            stitched_similarity_files=wrapped_output.similarity_files,
+            stitched_crlb_files=wrapped_output.crlb_files,
+            stitched_closure_phase_files=wrapped_output.closure_phase_files,
+            stitched_ps_file=wrapped_output.ps_looked_file,
+            stitched_amp_dispersion_file=wrapped_output.amp_disp_looked_file,
+            unwrapped_paths=None,
+            conncomp_paths=None,
+            timeseries_paths=None,
+            timeseries_residual_paths=None,
+            reference_point=None,
+        )
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
@@ -857,7 +882,18 @@ def assemble_full_frame(
         return out_path
 
     stitched_ifg_paths = _assemble_list("stitched_ifg_paths")
-    stitched_cor_paths = _assemble_list("stitched_cor_paths")
+
+    # Generate interferometric correlations from assembled full-frame interferograms
+    # This is done here (not at block level) to avoid redundant computation on
+    # overlapping halo regions between blocks
+    logger.info("Generating interferometric correlations for assembled frame")
+    corr_window_size = (11, 11)  # Same default as in displacement workflow
+    stitched_cor_paths = interferogram.estimate_interferometric_correlations(
+        ifg_filenames=stitched_ifg_paths,
+        window_size=corr_window_size,
+        num_workers=3,
+    )
+
     stitched_temp_coh_files = _assemble_list("stitched_temp_coh_files")
     stitched_shp_count_files = _assemble_list("stitched_shp_count_files")
     stitched_similarity_files = _assemble_list("stitched_similarity_files")
@@ -902,6 +938,7 @@ def run_full_frame_unwrap_and_timeseries(
 ) -> OutputPaths:
     """Unwrap the assembled ifgs and invert the timeseries on the full frame.
 
+    Uses the interferometric correlations generated during assembly.
     Mirrors the last two stages of `dolphin.workflows.displacement.run` so the
     returned `OutputPaths` drops into disp-nisar's existing `create_products`.
     """
