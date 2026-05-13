@@ -1,4 +1,6 @@
 import logging
+from datetime import timedelta
+from pathlib import Path
 
 import h5py
 import isce3
@@ -6,9 +8,6 @@ import numpy as np
 from dolphin import baseline
 from dolphin._types import Filename
 from numpy.typing import ArrayLike
-from opera_utils import (
-    get_cslc_orbit,
-)
 from pyproj import CRS, Transformer
 
 logger = logging.getLogger(__name__)
@@ -50,6 +49,58 @@ def _get_grids(x: ArrayLike, y: ArrayLike, epsg: int) -> tuple:
     return lon, lat
 
 
+def _load_orbit_from_cache(cache_dir: Path, cslc_filename: Filename) -> tuple:
+    """Load orbit data from cache and reconstruct isce3.core.Orbit.
+
+    Parameters
+    ----------
+    cache_dir : Path
+        Directory containing cached orbit files
+    cslc_filename : Filename
+        Original CSLC filename (used to find matching cache)
+
+    Returns
+    -------
+    tuple[isce3.core.Orbit, isce3.core.LookSide]
+        Reconstructed orbit object and look side
+    """
+    from disp_nisar._orbit_cache import load_orbit_data
+
+    orbit_data = load_orbit_data(cache_dir, cslc_filename)
+    if orbit_data is None:
+        raise FileNotFoundError(
+            f"Could not load cached orbit data for {cslc_filename}. "
+            f"Ensure orbit cache was generated at workflow start."
+        )
+
+    # Reconstruct isce3.core.Orbit from cached data
+    times = orbit_data["times"]
+    positions = orbit_data["positions"]
+    velocities = orbit_data["velocities"]
+    reference_epoch = orbit_data["reference_epoch"]
+
+    orbit_svs = []
+    for t, x, v in zip(times, positions, velocities):
+        orbit_svs.append(
+            isce3.core.StateVector(
+                isce3.core.DateTime(reference_epoch + timedelta(seconds=float(t))),
+                x,
+                v,
+            )
+        )
+
+    orbit = isce3.core.Orbit(orbit_svs)
+
+    # Convert look side string to isce3.core.LookSide
+    look_side_str = orbit_data["look_side"]
+    if look_side_str.lower() == "left":
+        side = isce3.core.LookSide.Left
+    else:
+        side = isce3.core.LookSide.Right
+
+    return orbit, side
+
+
 def compute_baselines(
     h5file_ref: Filename,
     h5file_sec: Filename,
@@ -61,6 +112,7 @@ def compute_baselines(
     threshold: float = 1e-08,
     maxiter: int = 50,
     delta_range: float = 10.0,
+    orbit_cache_dir: Path | None = None,
 ):
     """Compute the perpendicular baseline at a subsampled grid for two CSLCs.
 
@@ -85,6 +137,9 @@ def compute_baselines(
     delta_range : float
         isce3 geo2rdr: Step size used for computing derivative of doppler
         Default = 10.0
+    orbit_cache_dir : Path | None
+        Directory containing cached orbit data. If provided, will load orbits
+        from cache instead of accessing GSLC files.
 
     Returns
     -------
@@ -98,10 +153,19 @@ def compute_baselines(
 
     ellipsoid = isce3.core.Ellipsoid()
     zero_doppler = isce3.core.LUT2d()
-    side = _get_look_side(h5file_ref)
 
-    orbit_ref = get_cslc_orbit(h5file_ref)
-    orbit_sec = get_cslc_orbit(h5file_sec)
+    # Load orbit data from cache if available, otherwise from GSLC files
+    if orbit_cache_dir is not None and orbit_cache_dir.exists():
+        logger.info(f"Loading orbit data from cache: {orbit_cache_dir}")
+        orbit_ref, side_ref = _load_orbit_from_cache(orbit_cache_dir, h5file_ref)
+        orbit_sec, side_sec = _load_orbit_from_cache(orbit_cache_dir, h5file_sec)
+        side = side_ref  # Use reference look side
+    else:
+        logger.info("Loading orbit data from GSLC files")
+        from opera_utils import get_cslc_orbit
+        side = _get_look_side(h5file_ref)
+        orbit_ref = get_cslc_orbit(h5file_ref)
+        orbit_sec = get_cslc_orbit(h5file_sec)
 
     baselines = []
     failed_count = 0

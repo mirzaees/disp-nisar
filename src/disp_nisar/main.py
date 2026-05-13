@@ -244,6 +244,39 @@ def _run_azimuth_blocked(
         subdataset=cfg.input_options.subdataset,
         epsg=int(cfg.output_options.bounds_epsg or cfg.output_options.epsg),
     )
+
+    # Save GSLC grid metadata and orbit data for later use (e.g., baseline computation)
+    # This allows baseline computation to work even after original files are no longer
+    # accessible (e.g., in cloud workflows where files are deleted after processing)
+    import json
+    gslc_grid_file = cfg.work_directory / "gslc_grid_metadata.json"
+    with open(gslc_grid_file, "w") as f:
+        json.dump({
+            "bounds": {
+                "left": frame.bounds.left,
+                "bottom": frame.bounds.bottom,
+                "right": frame.bounds.right,
+                "top": frame.bounds.top,
+            },
+            "epsg": frame.epsg,
+            "x_res": frame.x_res,
+            "y_res": frame.y_res,
+            "rows": frame.rows,
+            "cols": frame.cols,
+            "geotransform": list(frame.geotransform),
+        }, f, indent=2)
+    logger.info(f"Saved GSLC grid metadata to {gslc_grid_file}")
+
+    # Save orbit data and metadata for all CSLC files for baseline computation
+    from disp_nisar._orbit_cache import save_orbit_metadata_for_cslcs
+    orbit_cache_dir = cfg.work_directory / "orbit_cache"
+    save_orbit_metadata_for_cslcs(
+        cslc_files=cfg.cslc_file_list,
+        subdataset=cfg.input_options.subdataset,
+        output_dir=orbit_cache_dir,
+    )
+    logger.info(f"Saved orbit metadata to {orbit_cache_dir}")
+
     overlap = resolve_overlap(cfg)
     blocks = compute_block_windows(
         total_rows=frame.rows, num_blocks=az_opts.num_blocks, overlap=overlap

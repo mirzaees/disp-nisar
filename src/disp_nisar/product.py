@@ -451,20 +451,46 @@ def create_output_product(
 
     # Compute baseline now (after displacement/mask arrays are freed) to avoid
     # holding a full-size float32 in memory during the filtering step above.
-    y, x = _create_yx_arrays(gt=gt, shape=shape)
+    # IMPORTANT: Use the geotransform from the ORIGINAL NISAR GSLC grid, not the
+    # stitched output. With azimuth blocks, the stitched output may have different
+    # bounds than the original GSLCs, causing geo2rdr to fail.
+    import json
+    gslc_grid_file = dolphin_config.work_directory / "gslc_grid_metadata.json"
+    if gslc_grid_file.exists():
+        logger.info(f"Loading GSLC grid metadata from {gslc_grid_file}")
+        with open(gslc_grid_file) as f:
+            gslc_grid = json.load(f)
+        # Use GSLC geotransform for baseline computation
+        y_baseline, x_baseline = _create_yx_arrays(
+            gt=tuple(gslc_grid["geotransform"]),
+            shape=(gslc_grid["rows"], gslc_grid["cols"])
+        )
+    else:
+        logger.warning(
+            f"GSLC grid metadata file not found at {gslc_grid_file}. "
+            "Using output grid for baseline computation (may fail with azimuth blocks)."
+        )
+        # Fallback to output grid (old behavior, may fail with blocks)
+        y_baseline, x_baseline = _create_yx_arrays(gt=gt, shape=shape)
+
     # TODO: do we need all corrections/smaller grids to be same subsample factor?
     subsample = 50
-    y, x = y[::subsample], x[::subsample]
+    y_baseline, x_baseline = y_baseline[::subsample], x_baseline[::subsample]
+
+    # Use orbit cache if available (allows baseline computation without GSLC file access)
+    orbit_cache_dir = dolphin_config.work_directory / "orbit_cache"
+
     try:
         logger.info("Calculating perpendicular baselines subsampled by %s", subsample)
         baseline_arr = compute_baselines(
             reference_start_file,
             secondary_start,
-            x=x,
-            y=y,
+            x=x_baseline,
+            y=y_baseline,
             epsg=crs.to_epsg(),
             wavelength=radar_wavelength,
             height=0,
+            orbit_cache_dir=orbit_cache_dir if orbit_cache_dir.exists() else None,
         )
     except Exception:
         logger.error(
@@ -473,7 +499,7 @@ def create_output_product(
             exc_info=True,
         )
         baseline_arr = np.zeros((100, 100))
-    del y, x
+    del y_baseline, x_baseline
     corrections["baseline"] = _interpolate_data(baseline_arr, shape=shape).astype(
         "float32"
     )
