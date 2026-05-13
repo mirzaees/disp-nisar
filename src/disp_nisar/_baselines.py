@@ -1,3 +1,5 @@
+import logging
+
 import h5py
 import isce3
 import numpy as np
@@ -8,6 +10,8 @@ from opera_utils import (
     get_cslc_orbit,
 )
 from pyproj import CRS, Transformer
+
+logger = logging.getLogger(__name__)
 
 
 def _get_look_side(h5file: Filename) -> isce3.core.LookSide:
@@ -100,38 +104,54 @@ def compute_baselines(
     orbit_sec = get_cslc_orbit(h5file_sec)
 
     baselines = []
+    failed_count = 0
+
     for lon, lat in zip(lon_arr, lat_arr):
         llh_rad = np.deg2rad([lon, lat, height]).reshape((3, 1))
-        az_time_ref, range_ref = isce3.geometry.geo2rdr(
-            llh_rad,
-            ellipsoid,
-            orbit_ref,
-            zero_doppler,
-            wavelength,
-            side,
-            threshold=threshold,
-            maxiter=maxiter,
-            delta_range=delta_range,
-        )
-        az_time_sec, range_sec = isce3.geometry.geo2rdr(
-            llh_rad,
-            ellipsoid,
-            orbit_sec,
-            zero_doppler,
-            wavelength,
-            side,
-            threshold=threshold,
-            maxiter=maxiter,
-            delta_range=delta_range,
-        )
 
-        pos_ref, velocity = orbit_ref.interpolate(az_time_ref)
-        pos_sec, _ = orbit_sec.interpolate(az_time_sec)
-        b = baseline.compute(
-            llh_rad, pos_ref, pos_sec, range_ref, range_sec, velocity, ellipsoid
-        )
+        try:
+            # Try to convert geographic to radar coordinates
+            az_time_ref, range_ref = isce3.geometry.geo2rdr(
+                llh_rad,
+                ellipsoid,
+                orbit_ref,
+                zero_doppler,
+                wavelength,
+                side,
+                threshold=threshold,
+                maxiter=maxiter,
+                delta_range=delta_range,
+            )
+            az_time_sec, range_sec = isce3.geometry.geo2rdr(
+                llh_rad,
+                ellipsoid,
+                orbit_sec,
+                zero_doppler,
+                wavelength,
+                side,
+                threshold=threshold,
+                maxiter=maxiter,
+                delta_range=delta_range,
+            )
 
-        baselines.append(b)
+            pos_ref, velocity = orbit_ref.interpolate(az_time_ref)
+            pos_sec, _ = orbit_sec.interpolate(az_time_sec)
+            b = baseline.compute(
+                llh_rad, pos_ref, pos_sec, range_ref, range_sec, velocity, ellipsoid
+            )
+            baselines.append(b)
+
+        except RuntimeError as e:
+            # geo2rdr failed to converge for this point (likely outside valid coverage)
+            # Use NaN for this location and continue
+            baselines.append(np.nan)
+            failed_count += 1
+
+    if failed_count > 0:
+        logger.warning(
+            f"Baseline computation: {failed_count}/{len(lon_arr)} points failed to "
+            f"converge (likely outside valid swath coverage). Using NaN for these points."
+        )
 
     return np.array(baselines).reshape(lon_grid.shape)
 
