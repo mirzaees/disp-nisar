@@ -850,7 +850,7 @@ def stitch_full_frame(
     network / ministacks, just evaluated over different azimuth windows.
     """
     from dolphin import stitching
-    from dolphin.io import EXTRA_COMPRESSED_TIFF_OPTIONS
+    from dolphin.io import DEFAULT_TIFF_OPTIONS, EXTRA_COMPRESSED_TIFF_OPTIONS
 
     if len(block_outputs) != len(blocks):
         raise ValueError(
@@ -865,6 +865,7 @@ def stitch_full_frame(
     # Stitch interferograms by date using dolphin's burst stitching approach
     # Use GeoTIFF format for self-contained, portable outputs that allow
     # block files to be cleaned up after stitching
+    # Use DEFAULT_TIFF_OPTIONS for complex data (interferograms are CFloat32)
     logger.info("Stitching interferograms from %d azimuth blocks", len(blocks))
     ifg_dir = out_dir / "interferograms"
     ifg_dir.mkdir(parents=True, exist_ok=True)
@@ -874,7 +875,7 @@ def stitch_full_frame(
         output_dir=ifg_dir,
         output_suffix=".int.tif",
         num_workers=3,
-        options=EXTRA_COMPRESSED_TIFF_OPTIONS,
+        options=DEFAULT_TIFF_OPTIONS,
     )
     stitched_ifg_paths = list(date_to_ifg.values())
 
@@ -970,6 +971,8 @@ def stitch_full_frame(
             all_comp_slcs.extend(block_output.comp_slc_dict[burst])
 
         # Stitch by date
+        # Use DEFAULT_TIFF_OPTIONS for complex data (not EXTRA_COMPRESSED which has
+        # NBITS/PREDICTOR that don't work with CFloat32)
         logger.info(f"Stitching compressed SLCs for burst {burst}")
         comp_slc_dir = ifg_dir / "compressed_slcs"
         comp_slc_dir.mkdir(exist_ok=True, parents=True)
@@ -979,7 +982,7 @@ def stitch_full_frame(
             output_dir=comp_slc_dir,
             output_suffix=".tif",
             num_workers=3,
-            options=EXTRA_COMPRESSED_TIFF_OPTIONS,
+            options=DEFAULT_TIFF_OPTIONS,
         )
         comp_slc_dict[burst] = list(date_to_comp_slc.values())
 
