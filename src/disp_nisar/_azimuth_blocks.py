@@ -292,11 +292,12 @@ def _narrow_cfg_for_block(
 
     The copy narrows `output_options.bounds` to the block's read window, disables
     unwrap and timeseries inversion (those run once on the assembled frame), and
-    redirects PS and phase_linking outputs to ``block_work_dir``.
+    redirects PS, phase_linking, and interferogram_network outputs to ``block_work_dir``.
 
-    Only PS and phase_linking directories are redirected to the block directory.
-    interferogram_network, unwrap_options, and timeseries_options remain pointing
-    to the main work directory since those stages run on the assembled full frame.
+    PS, phase_linking, and interferogram_network directories are redirected to the
+    block directory. Each block writes its own interferograms which are later assembled
+    to the main directory. unwrap_options and timeseries_options remain pointing to
+    the main work directory since those stages run on the assembled full frame.
     """
     block_cfg = copy.deepcopy(cfg)
     block_cfg.output_options.bounds = tuple(block_bounds(frame, block))
@@ -308,9 +309,9 @@ def _narrow_cfg_for_block(
     old_work_dir = block_cfg.work_directory
     block_cfg.work_directory = block_work_dir
 
-    # Redirect ONLY ps_options and phase_linking to block directory
-    # interferogram_network stays at main directory (interferograms assembled there)
-    for step in ["ps_options", "phase_linking"]:
+    # Redirect ps_options, phase_linking, and interferogram_network to block directory
+    # Each block writes its own interferograms which are later assembled to main directory
+    for step in ["ps_options", "phase_linking", "interferogram_network"]:
         opts = getattr(block_cfg, step)
         # Get the relative path from the old work directory
         try:
