@@ -671,8 +671,7 @@ def run_phase_linking_block(
             (p for p in staged_files if _stem_looks_like_nisar(p)),
             staged_files[0],
         )
-        block_mask = block_work_dir / "phase_linking/nodata_mask.tif"
-        block_mask.parent.mkdir(parents=True, exist_ok=True)
+        block_mask = block_work_dir / "nodata_mask.tif"
         _crop_frame_mask_to_block(frame_nodata_mask, template, block, block_mask, frame)
         block_cfg.layover_shadow_mask_files = [block_mask]
         logger.info(
@@ -803,53 +802,9 @@ def _run_phase_linking_blocks(
         return [f.result() for f in futures]
 
 
-def _allocate_like(
-    template: Path,
-    out_path: Path,
-    frame: FullFrameGrid,
-    nbands: int | None = None,
-) -> None:
-    """Create an empty full-frame raster with `template`'s dtype/nodata and the
-    full-frame geotransform/projection.
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    io.write_arr(
-        arr=None,
-        output_name=out_path,
-        like_filename=template,
-        shape=(frame.rows, frame.cols),
-        geotransform=frame.geotransform,
-        projection=frame.epsg,
-        nbands=nbands,
-    )
-
-
-def _copy_central_rows(
-    src: Path, dst: Path, block: BlockWindow, frame: FullFrameGrid
-) -> None:
-    """Copy the central rows of a per-block raster into the full-frame raster.
-
-    The source raster's row-0 corresponds to the block's ``read_start`` in the
-    full frame; the destination's row-0 corresponds to frame-row-0. We read the
-    central-row slice from the source and write it at ``block.write_start`` in
-    the destination.
-    """
-    src_row_start = block.write_start - block.read_start
-    src_row_stop = src_row_start + block.write_height
-    # Inputs from dolphin are single-band GeoTIFFs at the block's bounds.
-    arr = io.load_gdal(
-        src, rows=slice(src_row_start, src_row_stop), cols=slice(0, frame.cols)
-    )
-    if arr.ndim == 3:
-        # write_block handles (bands, rows, cols) directly.
-        io.write_block(arr, dst, row_start=block.write_start, col_start=0)
-    else:
-        io.write_block(arr, dst, row_start=block.write_start, col_start=0)
-
-
 @dataclass
-class AssembledFramePaths:
-    """Full-frame rasters produced by `assemble_full_frame`.
+class StitchedFramePaths:
+    """Full-frame rasters produced by `stitch_full_frame`.
 
     Field names match `dolphin.workflows.displacement.OutputPaths` where they
     overlap, so the downstream unwrap/timeseries/products code can consume
@@ -878,92 +833,158 @@ class AssembledFramePaths:
         return self.stitched_similarity_files[-1]
 
 
-def assemble_full_frame(
+def stitch_full_frame(
     block_outputs: Sequence[OutputPaths],
     blocks: Sequence[BlockWindow],
-    frame: FullFrameGrid,
     out_dir: Path,
-) -> AssembledFramePaths:
-    """Pre-allocate full-frame rasters and copy each block's central rows in.
+) -> StitchedFramePaths:
+    """Stitch azimuth blocks together using dolphin's spatial stitching.
+
+    Treats each azimuth block as a spatial subset (like a burst) and uses
+    dolphin's stitching functions to merge them into full-frame VRT outputs.
+    This is faster and more efficient than copying data into GeoTIFFs.
 
     Every `OutputPaths.stitched_*` field is assembled. The per-block lists
     (ifgs, correlations, temp-coh, SHP counts, similarity) must match in length
     and ordering across blocks — they correspond to the same interferogram
     network / ministacks, just evaluated over different azimuth windows.
     """
+    from dolphin import stitching
+    from dolphin.io import EXTRA_COMPRESSED_TIFF_OPTIONS
+
     if len(block_outputs) != len(blocks):
         raise ValueError(
             f"Got {len(block_outputs)} block outputs but {len(blocks)} block windows"
         )
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    def _assemble_list(attr: str) -> list[Path]:
-        per_block_lists = [getattr(b, attr) for b in block_outputs]
-        n = len(per_block_lists[0])
-        if any(len(lst) != n for lst in per_block_lists):
-            raise ValueError(
-                f"Per-block lists disagree in length for {attr}:"
-                f" {[len(lst) for lst in per_block_lists]}"
-            )
-        out_paths: list[Path] = []
-        for i in range(n):
-            template = Path(per_block_lists[0][i])
-            out_path = out_dir / template.name
-            _allocate_like(template, out_path, frame)
-            for block, per_block in zip(blocks, per_block_lists):
-                _copy_central_rows(Path(per_block[i]), out_path, block, frame)
-            out_paths.append(out_path)
-        return out_paths
+    # Collect all interferograms from all blocks (flatten the lists)
+    all_ifg_files = []
+    for block_output in block_outputs:
+        all_ifg_files.extend(block_output.stitched_ifg_paths)
 
-    def _assemble_single(attr: str) -> Path:
-        per_block = [Path(getattr(b, attr)) for b in block_outputs]
-        out_path = out_dir / per_block[0].name
-        _allocate_like(per_block[0], out_path, frame)
-        for block, src in zip(blocks, per_block):
-            _copy_central_rows(src, out_path, block, frame)
-        return out_path
+    # Stitch interferograms by date using dolphin's burst stitching approach
+    # Use GeoTIFF format for self-contained, portable outputs that allow
+    # block files to be cleaned up after stitching
+    logger.info("Stitching interferograms from %d azimuth blocks", len(blocks))
+    ifg_dir = out_dir / "interferograms"
+    ifg_dir.mkdir(parents=True, exist_ok=True)
+    date_to_ifg = stitching.merge_by_date(
+        image_file_list=all_ifg_files,
+        file_date_fmt="%Y%m%d",
+        output_dir=ifg_dir,
+        output_suffix=".int.tif",
+        num_workers=3,
+        options=EXTRA_COMPRESSED_TIFF_OPTIONS,
+    )
+    stitched_ifg_paths = list(date_to_ifg.values())
 
-    stitched_ifg_paths = _assemble_list("stitched_ifg_paths")
-
-    # Generate interferometric correlations from assembled full-frame interferograms
-    # This is done here (not at block level) to avoid redundant computation on
-    # overlapping halo regions between blocks
-    logger.info("Generating interferometric correlations for assembled frame")
-    corr_window_size = (11, 11)  # Same default as in displacement workflow
+    # Generate interferometric correlations from stitched interferograms
+    logger.info("Generating interferometric correlations for stitched frame")
+    corr_window_size = (11, 11)
     stitched_cor_paths = interferogram.estimate_interferometric_correlations(
         ifg_filenames=stitched_ifg_paths,
         window_size=corr_window_size,
         num_workers=3,
+        options=EXTRA_COMPRESSED_TIFF_OPTIONS,
     )
 
-    stitched_temp_coh_files = _assemble_list("stitched_temp_coh_files")
-    stitched_shp_count_files = _assemble_list("stitched_shp_count_files")
-    stitched_similarity_files = _assemble_list("stitched_similarity_files")
-    stitched_ps_file = _assemble_single("stitched_ps_file")
-    stitched_amp_dispersion_file = _assemble_single("stitched_amp_dispersion_file")
+    # Stitch temporal coherence files
+    all_temp_coh = []
+    for block_output in block_outputs:
+        all_temp_coh.extend(block_output.stitched_temp_coh_files)
 
-    # Compressed SLCs are produced per-ministack with the block's narrowed bounds.
-    # Assemble each ministack's compressed SLC into a full-frame version.
+    logger.info("Stitching temporal coherence files")
+    date_to_temp_coh = stitching.merge_by_date(
+        image_file_list=all_temp_coh,
+        file_date_fmt="%Y%m%d",
+        output_dir=ifg_dir,
+        output_prefix="auto",
+        num_workers=3,
+        options=EXTRA_COMPRESSED_TIFF_OPTIONS,
+    )
+    stitched_temp_coh_files = list(date_to_temp_coh.values())
+
+    # Stitch SHP count files
+    all_shp_counts = []
+    for block_output in block_outputs:
+        all_shp_counts.extend(block_output.stitched_shp_count_files)
+
+    logger.info("Stitching SHP count files")
+    date_to_shp_count = stitching.merge_by_date(
+        image_file_list=all_shp_counts,
+        file_date_fmt="%Y%m%d",
+        output_dir=ifg_dir,
+        output_prefix="auto",
+        num_workers=3,
+    )
+    stitched_shp_count_files = list(date_to_shp_count.values())
+
+    # Stitch similarity files
+    all_similarity = []
+    for block_output in block_outputs:
+        all_similarity.extend(block_output.stitched_similarity_files)
+
+    logger.info("Stitching similarity files")
+    date_to_similarity = stitching.merge_by_date(
+        image_file_list=all_similarity,
+        file_date_fmt="%Y%m%d",
+        output_dir=ifg_dir,
+        output_prefix="auto",
+        resample_alg="nearest",
+        num_workers=3,
+    )
+    stitched_similarity_files = list(date_to_similarity.values())
+
+    # Stitch PS mask files (single file, not by date)
+    ps_file_list = [block_output.stitched_ps_file for block_output in block_outputs]
+    stitched_ps_file = ifg_dir / "ps_mask_looked.tif"
+    logger.info("Stitching PS mask files")
+    if not stitched_ps_file.exists():
+        stitching.merge_images(
+            ps_file_list,
+            outfile=stitched_ps_file,
+            out_nodata=255,
+            resample_alg="nearest",
+        )
+
+    # Stitch amplitude dispersion files (single file, not by date)
+    amp_disp_list = [
+        block_output.stitched_amp_dispersion_file for block_output in block_outputs
+    ]
+    stitched_amp_dispersion_file = ifg_dir / "amp_dispersion_looked.tif"
+    logger.info("Stitching amplitude dispersion files")
+    if not stitched_amp_dispersion_file.exists():
+        stitching.merge_images(
+            amp_disp_list,
+            outfile=stitched_amp_dispersion_file,
+            resample_alg="nearest",
+        )
+
+    # Stitch compressed SLCs
     comp_slc_dict: dict[str, list[Path]] = {}
     burst_keys = list(block_outputs[0].comp_slc_dict.keys())
     for burst in burst_keys:
-        ministacks = [b.comp_slc_dict[burst] for b in block_outputs]
-        n = len(ministacks[0])
-        if any(len(lst) != n for lst in ministacks):
-            raise ValueError(
-                f"Compressed SLC list lengths differ across blocks for burst {burst}"
-            )
-        assembled: list[Path] = []
-        for i in range(n):
-            template = Path(ministacks[0][i])
-            out_path = out_dir / "compressed_slcs" / template.name
-            _allocate_like(template, out_path, frame)
-            for block, per_block in zip(blocks, ministacks):
-                _copy_central_rows(Path(per_block[i]), out_path, block, frame)
-            assembled.append(out_path)
-        comp_slc_dict[burst] = assembled
+        # Collect all compressed SLCs for this burst across all blocks
+        all_comp_slcs = []
+        for block_output in block_outputs:
+            all_comp_slcs.extend(block_output.comp_slc_dict[burst])
 
-    return AssembledFramePaths(
+        # Stitch by date
+        logger.info(f"Stitching compressed SLCs for burst {burst}")
+        comp_slc_dir = ifg_dir / "compressed_slcs"
+        comp_slc_dir.mkdir(exist_ok=True, parents=True)
+        date_to_comp_slc = stitching.merge_by_date(
+            image_file_list=all_comp_slcs,
+            file_date_fmt="%Y%m%d",
+            output_dir=comp_slc_dir,
+            output_suffix=".tif",
+            num_workers=3,
+            options=EXTRA_COMPRESSED_TIFF_OPTIONS,
+        )
+        comp_slc_dict[burst] = list(date_to_comp_slc.values())
+
+    logger.info("Finished stitching all azimuth blocks into full-frame outputs")
+    return StitchedFramePaths(
         stitched_ifg_paths=stitched_ifg_paths,
         stitched_cor_paths=stitched_cor_paths,
         stitched_temp_coh_files=stitched_temp_coh_files,
@@ -976,26 +997,26 @@ def assemble_full_frame(
 
 
 def run_full_frame_unwrap_and_timeseries(
-    cfg: DisplacementWorkflow, assembled: AssembledFramePaths
+    cfg: DisplacementWorkflow, stitched: StitchedFramePaths
 ) -> OutputPaths:
-    """Unwrap the assembled ifgs and invert the timeseries on the full frame.
+    """Unwrap the stitched ifgs and invert the timeseries on the full frame.
 
-    Uses the interferometric correlations generated during assembly.
+    Uses the interferometric correlations generated during stitching.
     Mirrors the last two stages of `dolphin.workflows.displacement.run` so the
     returned `OutputPaths` drops into disp-nisar's existing `create_products`.
     """
     from dolphin import timeseries
     from dolphin.workflows import unwrapping
 
-    avg_temp_coh_file = assembled.stitched_temp_coh_files[-1]
-    full_similarity_file = assembled.stitched_similarity_files[-1]
+    avg_temp_coh_file = stitched.stitched_temp_coh_files[-1]
+    full_similarity_file = stitched.stitched_similarity_files[-1]
 
     row_looks, col_looks = cfg.phase_linking.half_window.to_looks()
     nlooks = row_looks * col_looks
 
     unwrapped_paths, conncomp_paths = unwrapping.run(
-        ifg_file_list=assembled.stitched_ifg_paths,
-        cor_file_list=assembled.stitched_cor_paths,
+        ifg_file_list=stitched.stitched_ifg_paths,
+        cor_file_list=stitched.stitched_cor_paths,
         temporal_coherence_filename=avg_temp_coh_file,
         similarity_filename=full_similarity_file,
         nlooks=nlooks,
@@ -1008,7 +1029,7 @@ def run_full_frame_unwrap_and_timeseries(
         timeseries_paths, timeseries_residual_paths, reference_point = timeseries.run(
             unwrapped_paths=unwrapped_paths,
             conncomp_paths=conncomp_paths,
-            corr_paths=assembled.stitched_cor_paths,
+            corr_paths=stitched.stitched_cor_paths,
             reference_point=cfg.timeseries_options.reference_point,
             quality_file=avg_temp_coh_file,
             reference_candidate_threshold=0.95,
@@ -1029,16 +1050,16 @@ def run_full_frame_unwrap_and_timeseries(
         reference_point = None
 
     return OutputPaths(
-        comp_slc_dict=assembled.comp_slc_dict,
-        stitched_ifg_paths=assembled.stitched_ifg_paths,
-        stitched_cor_paths=assembled.stitched_cor_paths,
-        stitched_temp_coh_files=assembled.stitched_temp_coh_files,
-        stitched_shp_count_files=assembled.stitched_shp_count_files,
-        stitched_similarity_files=assembled.stitched_similarity_files,
+        comp_slc_dict=stitched.comp_slc_dict,
+        stitched_ifg_paths=stitched.stitched_ifg_paths,
+        stitched_cor_paths=stitched.stitched_cor_paths,
+        stitched_temp_coh_files=stitched.stitched_temp_coh_files,
+        stitched_shp_count_files=stitched.stitched_shp_count_files,
+        stitched_similarity_files=stitched.stitched_similarity_files,
         stitched_crlb_files=[],
         stitched_closure_phase_files=[],
-        stitched_ps_file=assembled.stitched_ps_file,
-        stitched_amp_dispersion_file=assembled.stitched_amp_dispersion_file,
+        stitched_ps_file=stitched.stitched_ps_file,
+        stitched_amp_dispersion_file=stitched.stitched_amp_dispersion_file,
         unwrapped_paths=unwrapped_paths,
         conncomp_paths=conncomp_paths,
         timeseries_paths=timeseries_paths,

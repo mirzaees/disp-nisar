@@ -23,7 +23,7 @@ from opera_utils import get_dates, group_by_date
 from disp_nisar import __version__, product
 from disp_nisar._azimuth_blocks import (
     _run_phase_linking_blocks,
-    assemble_full_frame,
+    stitch_full_frame,
     build_frame_nodata_mask,
     compute_block_windows,
     load_block_outputs_from_shards,
@@ -306,14 +306,12 @@ def _run_azimuth_blocked(
             frame_nodata_mask=frame_nodata_mask,
         )
 
-    assembled_dir = cfg.work_directory / "assembled"
-    assembled = assemble_full_frame(
+    stitched = stitch_full_frame(
         block_outputs=block_outputs,
         blocks=blocks,
-        frame=frame,
-        out_dir=assembled_dir,
+        out_dir=cfg.work_directory,
     )
-    return run_full_frame_unwrap_and_timeseries(cfg, assembled)
+    return run_full_frame_unwrap_and_timeseries(cfg, stitched)
 
 
 def create_products(
