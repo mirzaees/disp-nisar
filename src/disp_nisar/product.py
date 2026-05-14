@@ -180,31 +180,38 @@ def create_output_product(
         logger.debug(f"Start, end files: {start}, {end}")
         return start, end
 
+    # Use orbit cache if available (allows product creation without GSLC file access)
+    orbit_cache_dir = dolphin_config.work_directory / "orbit_cache"
+
     # TODO: the following functions from opera_utils need to be checked for NISAR
     reference_start_file, reference_end_file = _get_start_end_cslcs(
         reference_cslc_files
     )
-    reference_start_time = get_zero_doppler_time(
+    reference_start_time = _get_zero_doppler_time_cached(
         reference_start_file,
         dataset=f"{NISAR_IDENTIFICATION_GROUP}/zeroDopplerStartTime",
         datetime_format="%Y-%m-%dT%H:%M:%S.%f",
+        cache_dir=orbit_cache_dir,
     )
-    reference_end_time = get_zero_doppler_time(
+    reference_end_time = _get_zero_doppler_time_cached(
         reference_end_file,
         dataset=f"{NISAR_IDENTIFICATION_GROUP}/zeroDopplerEndTime",
         datetime_format="%Y-%m-%dT%H:%M:%S.%f",
+        cache_dir=orbit_cache_dir,
     )
 
     secondary_start, secondary_end = _get_start_end_cslcs(secondary_cslc_files)
-    secondary_start_time = get_zero_doppler_time(
+    secondary_start_time = _get_zero_doppler_time_cached(
         secondary_start,
         dataset=f"{NISAR_IDENTIFICATION_GROUP}/zeroDopplerStartTime",
         datetime_format="%Y-%m-%dT%H:%M:%S.%f",
+        cache_dir=orbit_cache_dir,
     )
-    secondary_end_time = get_zero_doppler_time(
+    secondary_end_time = _get_zero_doppler_time_cached(
         secondary_end,
         dataset=f"{NISAR_IDENTIFICATION_GROUP}/zeroDopplerEndTime",
         datetime_format="%Y-%m-%dT%H:%M:%S.%f",
+        cache_dir=orbit_cache_dir,
     )
 
     phase2disp = -1 * float(radar_wavelength) / (4.0 * np.pi)
@@ -477,9 +484,6 @@ def create_output_product(
     subsample = 50
     y_baseline, x_baseline = y_baseline[::subsample], x_baseline[::subsample]
 
-    # Use orbit cache if available (allows baseline computation without GSLC file access)
-    orbit_cache_dir = dolphin_config.work_directory / "orbit_cache"
-
     try:
         logger.info("Calculating perpendicular baselines subsampled by %s", subsample)
         baseline_arr = compute_baselines(
@@ -510,7 +514,9 @@ def create_output_product(
         ref_tuple = (
             (reference_point.row, reference_point.col) if reference_point else None
         )
-        orbit_direction = _get_orbit_direction(reference_cslc_files[0])
+        orbit_direction = _get_orbit_direction(
+            reference_cslc_files[0], cache_dir=orbit_cache_dir
+        )
         solid_earth_los = calculate_solid_earth_tides_correction(
             like_filename=unw_filename,
             reference_start_time=reference_start_time,
@@ -534,8 +540,12 @@ def create_output_product(
         reference_point=reference_point,
     )
 
-    reference_orbit_type = _get_orbit_type(reference_cslc_files[0])
-    secondary_orbit_type = _get_orbit_type(secondary_cslc_files[0])
+    reference_orbit_type = _get_orbit_type(
+        reference_cslc_files[0], cache_dir=orbit_cache_dir
+    )
+    secondary_orbit_type = _get_orbit_type(
+        secondary_cslc_files[0], cache_dir=orbit_cache_dir
+    )
     _create_identification_group(
         output_name=output_name,
         pge_runconfig=pge_runconfig,
@@ -563,6 +573,7 @@ def create_output_product(
         reference_cslc_file=reference_start_file,
         secondary_cslc_file=secondary_start,
         output_disp_file=output_name,
+        cache_dir=orbit_cache_dir,
     )
     # Final repack to remove "Unaccounted space"
     logger.info(f"Repacking {output_name} with h5repack")
@@ -1558,7 +1569,82 @@ def _create_metadata_group(
         )
 
 
-def _get_orbit_direction(cslc_filename: Filename) -> Literal["ascending", "descending"]:
+def _get_zero_doppler_time_cached(
+    cslc_filename: Filename,
+    dataset: str,
+    datetime_format: str,
+    cache_dir: Path | None = None,
+) -> datetime.datetime:
+    """Get zero doppler time from cache or GSLC file.
+
+    Parameters
+    ----------
+    cslc_filename : Filename
+        Path to GSLC file
+    dataset : str
+        HDF5 dataset path (e.g., "/science/LSAR/identification/zeroDopplerStartTime")
+    datetime_format : str
+        Format string for datetime parsing
+    cache_dir : Path | None
+        Directory containing cached metadata. If provided and exists,
+        will load from cache instead of accessing GSLC file.
+
+    Returns
+    -------
+    datetime.datetime
+        Zero doppler time
+    """
+    # Try cache first if available
+    if cache_dir is not None and cache_dir.exists():
+        from ._orbit_cache import get_zero_doppler_time_from_cache
+
+        # Determine if this is start or end time
+        start_or_end = "start" if "Start" in dataset else "end"
+        zd_time = get_zero_doppler_time_from_cache(cache_dir, cslc_filename, start_or_end)
+        if zd_time is not None:
+            logger.debug(
+                f"Loaded zero doppler {start_or_end} time from cache for {cslc_filename}"
+            )
+            return zd_time
+        logger.debug(
+            f"Zero doppler time not in cache, accessing file {cslc_filename}"
+        )
+
+    # Fallback to reading from file
+    return get_zero_doppler_time(
+        cslc_filename, dataset=dataset, datetime_format=datetime_format
+    )
+
+
+def _get_orbit_direction(
+    cslc_filename: Filename, cache_dir: Path | None = None
+) -> Literal["ascending", "descending"]:
+    """Get orbit direction from cache or GSLC file.
+
+    Parameters
+    ----------
+    cslc_filename : Filename
+        Path to GSLC file
+    cache_dir : Path | None
+        Directory containing cached metadata. If provided and exists,
+        will load from cache instead of accessing GSLC file.
+
+    Returns
+    -------
+    str
+        "ascending" or "descending"
+    """
+    # Try cache first if available
+    if cache_dir is not None and cache_dir.exists():
+        from ._orbit_cache import get_orbit_direction_from_cache
+
+        orbit_dir = get_orbit_direction_from_cache(cache_dir, cslc_filename)
+        if orbit_dir is not None:
+            logger.debug(f"Loaded orbit direction from cache for {cslc_filename}")
+            return orbit_dir
+        logger.debug(f"Orbit direction not in cache, accessing file {cslc_filename}")
+
+    # Fallback to reading from file
     with h5py.File(cslc_filename) as hf:
         out = hf["/identification/orbit_pass_direction"][()]
         if isinstance(out, bytes):
@@ -1568,6 +1654,7 @@ def _get_orbit_direction(cslc_filename: Filename) -> Literal["ascending", "desce
 
 def _get_orbit_type(
     cslc_filename: Filename,
+    cache_dir: Path | None = None,
 ) -> Literal[
     "Forecast Orbit Ephemeris",
     "Near real-time Orbit Ephemeris",
@@ -1575,6 +1662,41 @@ def _get_orbit_type(
     "precise orbit Ephemeris",
     "custom",
 ]:
+    """Get orbit type from cache or GSLC file.
+
+    Parameters
+    ----------
+    cslc_filename : Filename
+        Path to GSLC file
+    cache_dir : Path | None
+        Directory containing cached metadata. If provided and exists,
+        will load from cache instead of accessing GSLC file.
+
+    Returns
+    -------
+    str
+        Full orbit type name
+    """
+    # Try cache first if available
+    if cache_dir is not None and cache_dir.exists():
+        from ._orbit_cache import get_orbit_type_from_cache
+
+        orbit_type = get_orbit_type_from_cache(cache_dir, cslc_filename)
+        if orbit_type is not None:
+            logger.debug(f"Loaded orbit type from cache for {cslc_filename}")
+            return cast(
+                Literal[
+                    "Forecast Orbit Ephemeris",
+                    "Near real-time Orbit Ephemeris",
+                    "Medium precision Orbit Ephemeris",
+                    "precise orbit Ephemeris",
+                    "custom",
+                ],
+                orbit_type,
+            )
+        logger.debug(f"Orbit type not in cache, accessing file {cslc_filename}")
+
+    # Fallback to reading from file
     orbit_types = {
         "POE": "precise orbit Ephemeris",
         "FOE": "Forecast Orbit Ephemeris",
@@ -1892,7 +2014,18 @@ def process_compressed_slc(info: CompressedSLCInfo) -> Path:
             round_mantissa(disp_block, keep_bits=10)
             disp_dset[row_slice, :] = disp_block
 
-    copy_cslc_metadata_to_compressed(opera_cslc_file, outname)
+    # Try to use orbit cache if available - look for it in parent directories
+    # The cache is created at workflow start in work_directory/orbit_cache
+    cache_dir = None
+    search_path = Path(output_dir).resolve()
+    for _ in range(3):  # Search up to 3 levels
+        potential_cache = search_path / "orbit_cache"
+        if potential_cache.exists():
+            cache_dir = potential_cache
+            break
+        search_path = search_path.parent
+
+    copy_cslc_metadata_to_compressed(opera_cslc_file, outname, cache_dir=cache_dir)
 
     return outname
 
@@ -1938,7 +2071,9 @@ def _copy_hdf5_dsets(
 
 
 def copy_cslc_metadata_to_compressed(
-    opera_cslc_file: Filename, output_hdf5_file: Filename
+    opera_cslc_file: Filename,
+    output_hdf5_file: Filename,
+    cache_dir: Path | None = None,
 ) -> None:
     """Copy orbit and metadata datasets from the input CSLC file to the compressed SLC.
 
@@ -1948,44 +2083,70 @@ def copy_cslc_metadata_to_compressed(
         Path to the input CSLC file.
     output_hdf5_file : Filename
         Path to the output compressed SLC file.
+    cache_dir : Path | None
+        Directory containing cached metadata. If provided and exists,
+        will load from cache instead of accessing CSLC file.
 
     """
     # TODO: this function requires NISAR datasets and it should be based on frequency
     # and polarization. Hardcoding for now
+    # Note: orbit group handled separately - has complex structure
+    orbit_group = "/science/LSAR/GSLC/metadata/orbit"
     dsets_to_copy = [
-        ("/science/LSAR/GSLC/metadata/orbit", None),
-        # ("/metadata/processing_information/input_burst_metadata/wavelength", None),
-        (
-            "/science/LSAR/GSLC/metadata/sourceData/swaths/frequencyA/centerFrequency",
-            None,
-        ),
-        # ("/metadata/processing_information/input_burst_metadata/platform_id", None),
-        # ("/metadata/processing_information/input_burst_metadata/iw2_mid_range", None),
-        (
-            "/science/LSAR/GSLC/metadata/sourceData/processingInformation/parameters/frequencyA/slantRange",
-            None,
-        ),
-        ("/science/LSAR/identification/productSpecificationVersion", None),
-        ("/science/LSAR/identification/productVersion", None),
-        # ("/metadata/processing_information/input_burst_metadata/ipf_version", None),
-        # ("/metadata/processing_information/algorithms/COMPASS_version", None),
-        # ("/metadata/processing_information/algorithms/ISCE3_version", None),
-        # ("/metadata/processing_information/algorithms/s1_reader_version", None),
-        ("/science/LSAR/identification/zeroDopplerEndTime", None),
-        ("/science/LSAR/identification/zeroDopplerStartTime", None),
-        ("/science/LSAR/identification/boundingPolygon", None),
-        ("/science/LSAR/identification/missionId", None),
-        # ("/identification/instrument_name", None),
-        ("/science/LSAR/identification/lookDirection", None),
-        ("/science/LSAR/identification/trackNumber", None),
-        ("/science/LSAR/identification/orbitPassDirection", None),
-        ("/science/LSAR/identification/absoluteOrbitNumber", None),
-        ("/science/LSAR/GSLC/metadata/orbit/orbitType", None),
+        "/science/LSAR/GSLC/metadata/sourceData/swaths/frequencyA/centerFrequency",
+        "/science/LSAR/GSLC/metadata/sourceData/processingInformation/parameters/frequencyA/slantRange",
+        "/science/LSAR/identification/productSpecificationVersion",
+        "/science/LSAR/identification/productVersion",
+        "/science/LSAR/identification/zeroDopplerEndTime",
+        "/science/LSAR/identification/zeroDopplerStartTime",
+        "/science/LSAR/identification/boundingPolygon",
+        "/science/LSAR/identification/missionId",
+        "/science/LSAR/identification/lookDirection",
+        "/science/LSAR/identification/trackNumber",
+        "/science/LSAR/identification/orbitPassDirection",
+        "/science/LSAR/identification/absoluteOrbitNumber",
+        "/science/LSAR/GSLC/metadata/orbit/orbitType",
     ]
+
+    # Try cache first if available
+    if cache_dir is not None and cache_dir.exists():
+        from ._orbit_cache import copy_cached_metadata_to_file
+
+        try:
+            # Copy simple datasets from cache
+            copy_cached_metadata_to_file(
+                cache_dir=cache_dir,
+                cslc_filename=opera_cslc_file,
+                output_file=output_hdf5_file,
+                dsets_to_copy=dsets_to_copy,
+            )
+
+            # Copy orbit group directly from file (complex structure)
+            try:
+                _copy_hdf5_dsets(
+                    source_file=opera_cslc_file,
+                    dest_file=output_hdf5_file,
+                    dsets_to_copy=[(orbit_group, None)],
+                )
+            except Exception as e:
+                logger.warning(f"Failed to copy orbit group: {e}")
+
+            logger.debug(
+                f"Copied metadata from cache to {output_hdf5_file} for {opera_cslc_file}"
+            )
+            return
+        except Exception as e:
+            logger.warning(
+                f"Failed to copy from cache, falling back to file access: {e}"
+            )
+
+    # Fallback to direct file copying (including orbit group)
+    all_dsets = [orbit_group] + dsets_to_copy
+    dsets_to_copy_tuples = [(dset, None) for dset in all_dsets]
     _copy_hdf5_dsets(
         source_file=opera_cslc_file,
         dest_file=output_hdf5_file,
-        dsets_to_copy=dsets_to_copy,
+        dsets_to_copy=dsets_to_copy_tuples,
     )
     logger.debug(f"Copied metadata from {opera_cslc_file} to {output_hdf5_file}")
 
@@ -1994,53 +2155,72 @@ def copy_cslc_metadata_to_displacement(
     reference_cslc_file: Filename,
     secondary_cslc_file: Filename,
     output_disp_file: Filename,
+    cache_dir: Path | None = None,
 ) -> None:
-    """Copy metadata from input reference/secondary CSLC files to DISP output."""
-    dsets_to_copy = [("/metadata/orbit", None)]  #          Group
+    """Copy metadata from input reference/secondary CSLC files to DISP output.
+
+    Parameters
+    ----------
+    reference_cslc_file : Filename
+        Path to reference CSLC file
+    secondary_cslc_file : Filename
+        Path to secondary CSLC file
+    output_disp_file : Filename
+        Path to output displacement file
+    cache_dir : Path | None
+        Directory containing cached metadata. If provided and exists,
+        will load from cache instead of accessing CSLC files.
+    """
+    # Note: orbit group cannot be easily cached due to complex HDF5 structure,
+    # so we skip it here. If needed, could be added to cache in the future.
+    dsets_to_copy = ["/metadata/orbit"]  # Group
+
+    # Copy orbit groups with prepended names (these may not be in cache)
     for cslc_file, prepend_str in zip(
         [reference_cslc_file, secondary_cslc_file], ["reference_", "secondary_"]
     ):
-        _copy_hdf5_dsets(
-            source_file=cslc_file,
-            dest_file=output_disp_file,
-            dsets_to_copy=dsets_to_copy,
-            prepend_str=prepend_str,
-        )
+        try:
+            _copy_hdf5_dsets(
+                source_file=cslc_file,
+                dest_file=output_disp_file,
+                dsets_to_copy=[(dset, None) for dset in dsets_to_copy],
+                prepend_str=prepend_str,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to copy orbit group from {cslc_file}: {e}")
 
     # Add ones which should be same for both ref/sec
     common_dsets = [
-        # ("/identification/instrument_name", None),
-        ("/science/LSAR/identification/lookDirection", None),
-        ("/science/LSAR/identification/trackNumber", None),
-        ("/science/LSAR/identification/orbitPassDirection", None),
-        # ("/identification/absolute_orbit_number", None),
-        # Move this nested attribute into the `metadata/` group
-        # (
-        #     "/metadata/processing_information/input_burst_metadata/platform_id",
-        #     "metadata/platform_id",
-        # ),
-        # (
-        #     "/metadata/processing_information/input_burst_metadata/iw2_mid_range",
-        #     "metadata/slant_range_mid_swath",
-        # ),
-        # Be more explicit about what these attributes mean
-        # (
-        #     "/metadata/processing_information/algorithms/COMPASS_version",
-        #     "metadata/source_data_software_COMPASS_version",
-        # ),
-        # (
-        #     "/metadata/processing_information/algorithms/ISCE3_version",
-        #     "metadata/source_data_software_ISCE3_version",
-        # ),
-        # (
-        #     "/metadata/processing_information/algorithms/s1_reader_version",
-        #     "metadata/source_data_software_s1_reader_version",
-        # ),
+        "/science/LSAR/identification/lookDirection",
+        "/science/LSAR/identification/trackNumber",
+        "/science/LSAR/identification/orbitPassDirection",
     ]
+
+    # Try cache first if available
+    if cache_dir is not None and cache_dir.exists():
+        from ._orbit_cache import copy_cached_metadata_to_file
+
+        try:
+            copy_cached_metadata_to_file(
+                cache_dir=cache_dir,
+                cslc_filename=reference_cslc_file,
+                output_file=output_disp_file,
+                dsets_to_copy=common_dsets,
+            )
+            logger.debug(
+                f"Copied common metadata from cache to {output_disp_file}"
+            )
+            return
+        except Exception as e:
+            logger.warning(
+                f"Failed to copy from cache, falling back to file access: {e}"
+            )
+
+    # Fallback to direct file copying
     _copy_hdf5_dsets(
         source_file=reference_cslc_file,
         dest_file=output_disp_file,
-        dsets_to_copy=common_dsets,
+        dsets_to_copy=[(dset, None) for dset in common_dsets],
     )
 
 

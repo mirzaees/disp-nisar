@@ -631,6 +631,7 @@ def run_phase_linking_block(
     shard_dir: Path,
     debug: bool = False,
     frame_nodata_mask: Path | None = None,
+    layover_shadow_mask: Path | None = None,
 ) -> OutputPaths:
     """Run dolphin's displacement workflow for a single azimuth block (PL only).
 
@@ -666,19 +667,39 @@ def run_phase_linking_block(
     block_cfg.cslc_file_list = staged_files
     block_cfg.input_options.subdataset = new_subdataset
 
+    # Crop and combine masks for this block
+    block_masks = []
     if frame_nodata_mask is not None:
         template = next(
             (p for p in staged_files if _stem_looks_like_nisar(p)),
             staged_files[0],
         )
-        block_mask = block_work_dir / "nodata_mask.tif"
-        _crop_frame_mask_to_block(frame_nodata_mask, template, block, block_mask, frame)
-        block_cfg.layover_shadow_mask_files = [block_mask]
+        block_nodata_mask = block_work_dir / "nodata_mask.tif"
+        _crop_frame_mask_to_block(frame_nodata_mask, template, block, block_nodata_mask, frame)
+        block_masks.append(block_nodata_mask)
         logger.info(
             "Cropped frame nodata mask to block %d window -> %s",
             block.index,
-            block_mask,
+            block_nodata_mask,
         )
+
+    if layover_shadow_mask is not None:
+        template = next(
+            (p for p in staged_files if _stem_looks_like_nisar(p)),
+            staged_files[0],
+        )
+        block_layover_shadow = block_work_dir / "layover_shadow_mask.tif"
+        _crop_frame_mask_to_block(layover_shadow_mask, template, block, block_layover_shadow, frame)
+        block_masks.append(block_layover_shadow)
+        logger.info(
+            "Cropped layover/shadow mask to block %d window -> %s",
+            block.index,
+            block_layover_shadow,
+        )
+
+    # Assign combined masks to block config
+    if block_masks:
+        block_cfg.layover_shadow_mask_files = block_masks
 
     logger.info(
         "Running phase linking for block %d (rows %d..%d write, %d..%d read)",
@@ -754,6 +775,7 @@ def _run_phase_linking_blocks(
     n_parallel: int,
     debug: bool,
     frame_nodata_mask: Path | None = None,
+    layover_shadow_mask: Path | None = None,
 ) -> list[OutputPaths]:
     """Run PL for each block.
 
@@ -776,6 +798,7 @@ def _run_phase_linking_blocks(
                     shard_dir,
                     debug=debug,
                     frame_nodata_mask=frame_nodata_mask,
+                    layover_shadow_mask=layover_shadow_mask,
                 )
             )
             if i < len(blocks) - 1:
@@ -796,6 +819,7 @@ def _run_phase_linking_blocks(
                 shard_dir,
                 debug,
                 frame_nodata_mask,
+                layover_shadow_mask,
             )
             for block in blocks
         ]

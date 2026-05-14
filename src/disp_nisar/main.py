@@ -277,6 +277,31 @@ def _run_azimuth_blocked(
     )
     logger.info(f"Saved orbit metadata to {orbit_cache_dir}")
 
+    # Prepare geometry layers at full resolution: incidence angle, LOS vectors, layover/shadow mask
+    # These are computed once at workflow start:
+    # - Layover/shadow mask: used in block-level masking
+    # - Incidence/LOS: downsampled later for product generation
+    geometry_dir = cfg.work_directory / "geometry"
+    layover_shadow_mask = None
+    if pge_runconfig.dynamic_ancillary_file_group.dem_file is not None:
+        from disp_nisar._geometry import prepare_geometry_layers
+
+        try:
+            logger.info("Preparing full-resolution geometry layers (incidence, LOS, layover/shadow)")
+            geometry_layers = prepare_geometry_layers(
+                gslc_path=_first_non_compressed,
+                dem_path=pge_runconfig.dynamic_ancillary_file_group.dem_file,
+                output_dir=geometry_dir,
+                n_workers=cfg.worker_settings.n_parallel_bursts or 4,
+            )
+            layover_shadow_mask = geometry_layers.get("layover_shadow_mask")
+            logger.info(f"Geometry layers saved to {geometry_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to prepare geometry layers: {e}", exc_info=True)
+            logger.warning("Continuing without geometry layers")
+    else:
+        logger.info("No DEM provided, skipping geometry layer preparation")
+
     overlap = resolve_overlap(cfg)
     blocks = compute_block_windows(
         total_rows=frame.rows, num_blocks=az_opts.num_blocks, overlap=overlap
@@ -306,6 +331,9 @@ def _run_azimuth_blocked(
             " bounds mask alone."
         )
 
+    if layover_shadow_mask is not None:
+        logger.info(f"Using layover/shadow mask for block processing: {layover_shadow_mask}")
+
     block_index = az_opts.block_index
 
     if block_index is not None and block_index >= 0:
@@ -321,6 +349,7 @@ def _run_azimuth_blocked(
             shard_dir,
             debug=debug,
             frame_nodata_mask=frame_nodata_mask,
+            layover_shadow_mask=layover_shadow_mask,
         )
         return None
 
@@ -337,6 +366,7 @@ def _run_azimuth_blocked(
             n_parallel=az_opts.n_parallel_blocks,
             debug=debug,
             frame_nodata_mask=frame_nodata_mask,
+            layover_shadow_mask=layover_shadow_mask,
         )
 
     stitched = stitch_full_frame(
@@ -377,15 +407,54 @@ def create_products(
     assert out_paths.timeseries_paths is not None
     ref_point = read_reference_point(out_paths.timeseries_paths[0].parent)
 
-    # Find the geometry files, if created
-    los_east_file: Path | None
-    los_north_file: Path | None
-    try:
-        los_east_file = next(cfg.work_directory.rglob("los_east.tif"))
-        assert los_east_file is not None
-        los_north_file = los_east_file.parent / "los_north.tif"
-    except StopIteration:
-        los_east_file = los_north_file = None
+    # Find and downsample geometry files for product creation
+    # Geometry layers are created at full resolution for masking,
+    # but need to be downsampled to match final product grid
+    los_east_file: Path | None = None
+    los_north_file: Path | None = None
+    incidence_angle_file: Path | None = None
+
+    geometry_dir = cfg.work_directory / "geometry"
+    full_res_incidence = geometry_dir / "incidence_angle.tif"
+    full_res_los_east = geometry_dir / "los_east.tif"
+    full_res_los_north = geometry_dir / "los_north.tif"
+
+    # Check if full-resolution geometry layers exist
+    if (
+        full_res_incidence.exists()
+        and full_res_los_east.exists()
+        and full_res_los_north.exists()
+        and out_paths.timeseries_paths
+    ):
+        # Downsample to match first timeseries product grid
+        from disp_nisar._geometry import downsample_geometry_for_products
+
+        try:
+            logger.info("Downsampling geometry layers for product generation")
+            downsampled_dir = cfg.work_directory / "geometry_downsampled"
+            downsampled = downsample_geometry_for_products(
+                incidence_angle_path=full_res_incidence,
+                los_east_path=full_res_los_east,
+                los_north_path=full_res_los_north,
+                reference_raster=out_paths.timeseries_paths[0],
+                output_dir=downsampled_dir,
+            )
+            incidence_angle_file = downsampled["incidence_angle"]
+            los_east_file = downsampled["los_east"]
+            los_north_file = downsampled["los_north"]
+            logger.info(f"Downsampled geometry saved to {downsampled_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to downsample geometry layers: {e}", exc_info=True)
+    else:
+        # Fallback: try to find any geometry files (old behavior)
+        try:
+            los_east_file = next(cfg.work_directory.rglob("los_east*.tif"))
+            los_north_file = los_east_file.parent / "los_north.tif"
+            incidence_angle_file = los_east_file.parent / "incidence_angle.tif"
+            if not incidence_angle_file.exists():
+                incidence_angle_file = None
+        except StopIteration:
+            pass
 
     # Finalize the output as an HDF5 product
     out_dir = pge_runconfig.product_path_group.output_directory
@@ -479,15 +548,11 @@ def create_products(
             )
 
     # Get the incidence angles for /identification metadata
-    # TODO: There is no geometry files, all are included in the data as
-    # radar grid datacube
-    if len(cfg.correction_options.geometry_files) > 0:
-        near_far_incidence_angles = _get_near_far_incidence_angles(
-            cfg.correction_options.geometry_files
-        )
-    else:
-        logger.warning("Using approximate incidence angles")
-        near_far_incidence_angles = 33.0, 47.0
+    # Use geometry layers created at workflow start if available
+    near_far_incidence_angles = _get_near_far_incidence_angles(
+        geometry_files=cfg.correction_options.geometry_files,
+        incidence_angle_file=incidence_angle_file,
+    )
 
     algorithm_parameters = AlgorithmParameters.from_yaml(
         pge_runconfig.dynamic_ancillary_file_group.algorithm_parameters_file
@@ -591,21 +656,56 @@ def _assert_no_duplicate_dates(input_file_list: Sequence[Path]) -> None:
         raise ValueError(msg)
 
 
-def _get_near_far_incidence_angles(geometry_files: list[Path]) -> tuple[float, float]:
-    import h5py
+def _get_near_far_incidence_angles(
+    geometry_files: list[Path] | None = None,
+    incidence_angle_file: Path | None = None,
+) -> tuple[float, float]:
+    """Get near and far range incidence angles.
+
+    Parameters
+    ----------
+    geometry_files : list[Path] | None
+        List of GUNW geometry files (deprecated, for backward compatibility)
+    incidence_angle_file : Path | None
+        Path to incidence angle raster file
+
+    Returns
+    -------
+    tuple[float, float]
+        (near_incidence, far_incidence) in degrees
+    """
     import numpy as np
 
-    ##TODO: min and max of incidence angle in the data in radar grid
+    # Try using the incidence angle raster first (preferred)
+    if incidence_angle_file is not None and incidence_angle_file.exists():
+        from dolphin.io import load_gdal
 
-    with h5py.File(geometry_files[0]) as ds:
-        incidence_angles = ds["/science/LSAR/GUNW/metadata/radarGrid/incidenceAngle"][
-            ()
-        ]
+        logger.info(f"Loading incidence angles from {incidence_angle_file}")
+        incidence_angles = load_gdal(incidence_angle_file, masked=True)
+        near_incidence = float(np.nanmin(incidence_angles).round(1))
+        far_incidence = float(np.nanmax(incidence_angles).round(1))
+        logger.info(
+            f"Incidence angles: near={near_incidence:.1f}°, far={far_incidence:.1f}°"
+        )
+        return near_incidence, far_incidence
 
-    near_incidence = np.nanmin(incidence_angles).round(1)
-    far_incidence = np.nanmax(incidence_angles).round(1)
+    # Fall back to geometry files (for backward compatibility)
+    if geometry_files is not None and len(geometry_files) > 0:
+        import h5py
 
-    return near_incidence, far_incidence
+        logger.info(f"Loading incidence angles from geometry file {geometry_files[0]}")
+        with h5py.File(geometry_files[0]) as ds:
+            incidence_angles = ds[
+                "/science/LSAR/GUNW/metadata/radarGrid/incidenceAngle"
+            ][()]
+
+        near_incidence = float(np.nanmin(incidence_angles).round(1))
+        far_incidence = float(np.nanmax(incidence_angles).round(1))
+        return near_incidence, far_incidence
+
+    # Default values if no incidence angle data available
+    logger.warning("No incidence angle data available, using approximate values")
+    return 33.0, 47.0
 
 
 class ProductFiles(NamedTuple):
