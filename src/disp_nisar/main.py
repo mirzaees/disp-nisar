@@ -277,31 +277,9 @@ def _run_azimuth_blocked(
     )
     logger.info(f"Saved orbit metadata to {orbit_cache_dir}")
 
-    # Prepare geometry layers at full resolution: incidence angle, LOS vectors, layover/shadow mask
-    # These are computed once at workflow start:
-    # - Layover/shadow mask: used in block-level masking
-    # - Incidence/LOS: downsampled later for product generation
+    # Geometry layers will be created after the nodata mask (which defines the frame grid)
     geometry_dir = cfg.work_directory / "geometry"
     layover_shadow_mask = None
-    if pge_runconfig.dynamic_ancillary_file_group.dem_file is not None:
-        from disp_nisar._geometry import prepare_geometry_layers
-
-        try:
-            logger.info("Preparing full-resolution geometry layers (incidence, LOS, layover/shadow)")
-            geometry_layers = prepare_geometry_layers(
-                gslc_path=_first_non_compressed,
-                dem_path=pge_runconfig.dynamic_ancillary_file_group.dem_file,
-                output_dir=geometry_dir,
-                template_raster=_first_non_compressed,  # Use GSLC as template for exact frame grid
-                n_workers=cfg.worker_settings.n_parallel_bursts or 4,
-            )
-            layover_shadow_mask = geometry_layers.get("layover_shadow_mask")
-            logger.info(f"Geometry layers saved to {geometry_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to prepare geometry layers: {e}", exc_info=True)
-            logger.warning("Continuing without geometry layers")
-    else:
-        logger.info("No DEM provided, skipping geometry layer preparation")
 
     overlap = resolve_overlap(cfg)
     blocks = compute_block_windows(
@@ -332,8 +310,36 @@ def _run_azimuth_blocked(
             " bounds mask alone."
         )
 
+    # If we have a nodata mask but no geometry layers yet, create them now
+    # Use the nodata mask as the template since it has the correct frame grid
+    if (
+        frame_nodata_mask is not None
+        and layover_shadow_mask is None
+        and pge_runconfig.dynamic_ancillary_file_group.dem_file is not None
+    ):
+        from disp_nisar._geometry import prepare_geometry_layers
+
+        try:
+            logger.info(
+                "Creating geometry layers using nodata mask as frame grid template"
+            )
+            geometry_layers = prepare_geometry_layers(
+                gslc_path=_first_non_compressed,
+                dem_path=pge_runconfig.dynamic_ancillary_file_group.dem_file,
+                output_dir=geometry_dir,
+                template_raster=frame_nodata_mask,  # Use nodata mask as template
+                n_workers=cfg.worker_settings.n_parallel_bursts or 4,
+            )
+            layover_shadow_mask = geometry_layers.get("layover_shadow_mask")
+            logger.info(f"Geometry layers saved to {geometry_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to prepare geometry layers: {e}", exc_info=True)
+            logger.warning("Continuing without geometry layers")
+
     if layover_shadow_mask is not None:
-        logger.info(f"Using layover/shadow mask for block processing: {layover_shadow_mask}")
+        logger.info(
+            f"Using layover/shadow mask for block processing: {layover_shadow_mask}"
+        )
 
     block_index = az_opts.block_index
 
