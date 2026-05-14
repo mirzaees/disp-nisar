@@ -251,27 +251,71 @@ def load_grid_from_nisar_gslc(
     often lack an ``AUTHORITY`` tag and can defeat ``AutoIdentifyEPSG``.
     """
     from osgeo import gdal
+    from opera_utils import get_geotransform_from_nisar
 
     src_str = str(gslc_path)
-    if subdataset and src_str.lower().endswith((".h5", ".hdf5", ".nc")):
-        uri = f'HDF5:"{src_str}"://{subdataset.lstrip("/")}'
-    else:
-        uri = src_str
-    ds = gdal.Open(uri)
-    if ds is None:
-        raise RuntimeError(f"GDAL could not open NISAR GSLC at {uri}")
+
+    # Try to get geotransform using opera-utils (handles NISAR multidim metadata)
+    gt = None
     try:
-        gt = ds.GetGeoTransform()
-        rows = ds.RasterYSize
-        cols = ds.RasterXSize
-    finally:
-        ds = None
+        result = get_geotransform_from_nisar(src_str, dataset_name=subdataset)
+        if result is not None:
+            gt, _projection = result
+            logger.debug(f"Got geotransform from NISAR multidim API: {gt}")
+    except Exception as e:
+        logger.debug(f"Could not get geotransform via opera-utils: {e}")
+
+    # Fallback to standard GDAL if opera-utils didn't work
+    if gt is None or tuple(gt) == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
+        logger.debug("Falling back to standard GDAL GetGeoTransform")
+        if subdataset and src_str.lower().endswith((".h5", ".hdf5", ".nc")):
+            uri = f'HDF5:"{src_str}"://{subdataset.lstrip("/")}'
+        else:
+            uri = src_str
+        ds = gdal.Open(uri)
+        if ds is None:
+            raise RuntimeError(f"GDAL could not open NISAR GSLC at {uri}")
+        try:
+            gt = ds.GetGeoTransform()
+            rows = ds.RasterYSize
+            cols = ds.RasterXSize
+        finally:
+            ds = None
+    else:
+        # Got valid geotransform from opera-utils, now get dimensions
+        if subdataset and src_str.lower().endswith((".h5", ".hdf5", ".nc")):
+            uri = f'HDF5:"{src_str}"://{subdataset.lstrip("/")}'
+        else:
+            uri = src_str
+        ds = gdal.Open(uri)
+        if ds is None:
+            raise RuntimeError(f"GDAL could not open NISAR GSLC at {uri}")
+        try:
+            rows = ds.RasterYSize
+            cols = ds.RasterXSize
+        finally:
+            ds = None
+
+    # Validate geotransform
+    if gt is None or tuple(gt) == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
+        raise RuntimeError(
+            f"Could not get valid geotransform from {src_str}. "
+            "Got identity matrix, which means the file is not properly georeferenced."
+        )
+
     left = gt[0]
     x_res = gt[1]
     top = gt[3]
     y_res = abs(gt[5])
     right = left + cols * x_res
     bottom = top - rows * y_res
+
+    logger.info(
+        f"Loaded NISAR GSLC grid: {cols}x{rows} pixels, "
+        f"bounds: ({left:.2f}, {bottom:.2f}, {right:.2f}, {top:.2f}), "
+        f"resolution: {x_res:.2f} x {y_res:.2f}"
+    )
+
     return FullFrameGrid(
         bounds=Bbox(left, bottom, right, top),
         epsg=int(epsg),
