@@ -9,10 +9,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 import rioxarray as rxr
-import xarray as xr
 from dolphin._types import Filename
 from pyproj import Transformer
-from rasterio.enums import Resampling
 from scipy.interpolate import RegularGridInterpolator
 from tqdm import tqdm
 
@@ -201,17 +199,49 @@ def prepare_geometry_layers(
         f"CRS: {target_crs}"
     )
 
-    # Load and reproject DEM to match template grid
-    logger.info(f"Loading DEM from {dem_path}")
-    dem_src = rxr.open_rasterio(dem_path, masked=True).squeeze()
+    # Reproject DEM using fast GDAL warp (cached on disk)
+    logger.info(f"Reprojecting DEM from {dem_path}")
+    reprojected_dem_path = output_dir / "dem_reprojected.tif"
 
-    logger.info("Reprojecting DEM to match frame grid")
-    dem_da = dem_src.rio.reproject_match(template_da, resampling=Resampling.bilinear)
+    if reprojected_dem_path.exists():
+        logger.info(f"Using cached reprojected DEM: {reprojected_dem_path}")
+    else:
+        from osgeo import gdal
+
+        # Get template bounds and resolution
+        bounds = template_da.rio.bounds()
+        gt = template_da.rio.transform()
+        x_res = gt.a
+        y_res = -gt.e  # Negative because gt.e is negative for north-up
+
+        logger.info(
+            f"Warping DEM to match frame: {target_shape[1]}x{target_shape[0]}, "
+            f"resolution: {x_res:.2f}m"
+        )
+
+        # Use GDAL warp (much faster than rioxarray for large DEMs)
+        warp_options = gdal.WarpOptions(
+            format="GTiff",
+            dstSRS=str(target_crs),
+            outputBounds=(bounds[0], bounds[1], bounds[2], bounds[3]),
+            xRes=x_res,
+            yRes=y_res,
+            resampleAlg="bilinear",
+            creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"],
+            multithread=True,
+            warpMemoryLimit=512,  # MB
+        )
+
+        gdal.Warp(str(reprojected_dem_path), str(dem_path), options=warp_options)
+        logger.info(f"Saved reprojected DEM to {reprojected_dem_path}")
+
+    # Load the reprojected DEM
+    dem_da = rxr.open_rasterio(reprojected_dem_path, masked=True).squeeze()
     dem_val = dem_da.values
     dem_crs = target_crs
 
     # Clean up
-    del template_da, dem_src
+    del template_da
 
     # Flip y-axis for interpolation (radar grid may be top-to-bottom)
     y_rg_flip = y_rg[::-1]
@@ -244,11 +274,12 @@ def prepare_geometry_layers(
     los_east_surf = np.full(dem_da.shape, np.nan, dtype="float32")
     los_north_surf = np.full(dem_da.shape, np.nan, dtype="float32")
 
-    # Process in parallel
+    # Process in parallel with optimized chunking
     logger.info(f"Interpolating geometry data with {n_workers} workers")
+    chunksize = max(1, len(tasks) // (n_workers * 4))  # Optimize work distribution
     with mp.get_context("fork").Pool(processes=n_workers) as pool:
         for sl, results in tqdm(
-            pool.imap(_interp_chunk, tasks),
+            pool.imap(_interp_chunk, tasks, chunksize=chunksize),
             total=len(tasks),
             desc="Geometry interpolation",
         ):
@@ -261,29 +292,60 @@ def prepare_geometry_layers(
         np.clip(1.0 - los_east_surf**2 - los_north_surf**2, 0, None)
     ).astype("float32")
 
-    # Save all geometry layers at DEM (full) resolution
+    # Save all geometry layers at DEM (full) resolution using fast GDAL writes
     logger.info("Saving geometry layers at full resolution (DEM grid)")
+
+    from osgeo import gdal, osr
+
+    # Get geotransform and projection from DEM
+    gt = dem_da.rio.transform().to_gdal()
+    proj = osr.SpatialReference()
+    proj.ImportFromWkt(dem_crs.to_wkt())
+
+    # Helper function for fast GDAL writes
+    def _write_geotiff_fast(array, output_path, dtype, nodata=None):
+        driver = gdal.GetDriverByName("GTiff")
+        if dtype == gdal.GDT_Float32:
+            gdal_dtype = gdal.GDT_Float32
+        elif dtype == gdal.GDT_Byte:
+            gdal_dtype = gdal.GDT_Byte
+        else:
+            gdal_dtype = gdal.GDT_Float32
+
+        ds = driver.Create(
+            str(output_path),
+            array.shape[1],
+            array.shape[0],
+            1,
+            gdal_dtype,
+            options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"],
+        )
+        ds.SetGeoTransform(gt)
+        ds.SetProjection(proj.ExportToWkt())
+        band = ds.GetRasterBand(1)
+        if nodata is not None:
+            band.SetNoDataValue(nodata)
+        band.WriteArray(array)
+        band.FlushCache()
+        ds = None
 
     # Save incidence angle
     logger.info(f"Saving incidence angle to {incidence_path}")
-    inc_da = dem_da.copy(data=inc_surface).rio.write_crs(dem_crs)
-    inc_da.rio.to_raster(incidence_path, compress="deflate", dtype="float32")
+    _write_geotiff_fast(inc_surface, incidence_path, gdal.GDT_Float32, nodata=np.nan)
     logger.info(
         f"  Incidence angle range: {np.nanmin(inc_surface):.2f}–{np.nanmax(inc_surface):.2f} deg"
     )
 
     # Save LOS east component
     logger.info(f"Saving LOS east to {los_east_path}")
-    los_east_da = dem_da.copy(data=los_east_surf).rio.write_crs(dem_crs)
-    los_east_da.rio.to_raster(los_east_path, compress="deflate", dtype="float32")
+    _write_geotiff_fast(los_east_surf, los_east_path, gdal.GDT_Float32, nodata=np.nan)
     logger.info(
         f"  LOS east range: {np.nanmin(los_east_surf):.3f}–{np.nanmax(los_east_surf):.3f}"
     )
 
     # Save LOS north component
     logger.info(f"Saving LOS north to {los_north_path}")
-    los_north_da = dem_da.copy(data=los_north_surf).rio.write_crs(dem_crs)
-    los_north_da.rio.to_raster(los_north_path, compress="deflate", dtype="float32")
+    _write_geotiff_fast(los_north_surf, los_north_path, gdal.GDT_Float32, nodata=np.nan)
     logger.info(
         f"  LOS north range: {np.nanmin(los_north_surf):.3f}–{np.nanmax(los_north_surf):.3f}"
     )
@@ -295,14 +357,11 @@ def prepare_geometry_layers(
     )
 
     # Save as uint8: 0=bad (layover/shadow), 1=good
-    layover_shadow_da = xr.DataArray(
+    _write_geotiff_fast(
         layover_shadow_mask.astype(np.uint8),
-        dims=dem_da.dims,
-        coords=dem_da.coords,
-    ).rio.write_crs(dem_crs)
-    layover_shadow_da.rio.write_nodata(255, inplace=True)
-    layover_shadow_da.rio.to_raster(
-        layover_shadow_path, compress="deflate", dtype="uint8"
+        layover_shadow_path,
+        gdal.GDT_Byte,
+        nodata=255,
     )
     logger.info(f"Saved layover/shadow mask to {layover_shadow_path}")
     pct_bad = 100 * (1 - layover_shadow_mask.mean())
@@ -351,33 +410,63 @@ def downsample_geometry_for_products(
 
     # Load reference raster to get target grid
     logger.info(f"Downsampling geometry layers to match {reference_raster}")
-    ref = rxr.open_rasterio(reference_raster, masked=True).squeeze()
+
+    from osgeo import gdal
+
+    # Helper function for fast GDAL downsampling with caching
+    def _downsample_with_gdal(input_path, output_path, reference_raster):
+        """Use GDAL warp for fast downsampling."""
+        if output_path.exists():
+            logger.info(f"Using cached downsampled file: {output_path}")
+            return output_path
+
+        # Get reference grid info
+        ref_ds = gdal.Open(str(reference_raster))
+        ref_gt = ref_ds.GetGeoTransform()
+        ref_proj = ref_ds.GetProjection()
+        ref_xsize = ref_ds.RasterXSize
+        ref_ysize = ref_ds.RasterYSize
+        ref_ds = None
+
+        # Calculate bounds
+        left = ref_gt[0]
+        top = ref_gt[3]
+        right = left + ref_xsize * ref_gt[1]
+        bottom = top + ref_ysize * ref_gt[5]
+
+        # Use GDAL warp for fast resampling
+        warp_options = gdal.WarpOptions(
+            format="GTiff",
+            dstSRS=ref_proj,
+            outputBounds=(left, bottom, right, top),
+            width=ref_xsize,
+            height=ref_ysize,
+            resampleAlg="bilinear",
+            creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"],
+            multithread=True,
+            warpMemoryLimit=512,
+        )
+
+        gdal.Warp(str(output_path), str(input_path), options=warp_options)
+        logger.info(f"Downsampled to {output_path}")
+        return output_path
 
     outputs = {}
 
     # Downsample incidence angle
     inc_out = output_dir / "incidence_angle_downsampled.tif"
-    inc_da = rxr.open_rasterio(incidence_angle_path, masked=True).squeeze()
-    inc_matched = inc_da.rio.reproject_match(ref, resampling=Resampling.bilinear)
-    inc_matched.rio.to_raster(inc_out, compress="deflate", dtype="float32")
+    _downsample_with_gdal(incidence_angle_path, inc_out, reference_raster)
     outputs["incidence_angle"] = inc_out
-    logger.info(f"Saved downsampled incidence angle to {inc_out}")
 
     # Downsample LOS east
     los_e_out = output_dir / "los_east_downsampled.tif"
-    los_e_da = rxr.open_rasterio(los_east_path, masked=True).squeeze()
-    los_e_matched = los_e_da.rio.reproject_match(ref, resampling=Resampling.bilinear)
-    los_e_matched.rio.to_raster(los_e_out, compress="deflate", dtype="float32")
+    _downsample_with_gdal(los_east_path, los_e_out, reference_raster)
     outputs["los_east"] = los_e_out
-    logger.info(f"Saved downsampled LOS east to {los_e_out}")
 
     # Downsample LOS north
     los_n_out = output_dir / "los_north_downsampled.tif"
-    los_n_da = rxr.open_rasterio(los_north_path, masked=True).squeeze()
-    los_n_matched = los_n_da.rio.reproject_match(ref, resampling=Resampling.bilinear)
-    los_n_matched.rio.to_raster(los_n_out, compress="deflate", dtype="float32")
+    _downsample_with_gdal(los_north_path, los_n_out, reference_raster)
     outputs["los_north"] = los_n_out
-    logger.info(f"Saved downsampled LOS north to {los_n_out}")
 
     return outputs
 
