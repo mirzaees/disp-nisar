@@ -31,7 +31,7 @@ def _interp_chunk(args):
     Returns
     -------
     tuple
-        (incidence_chunk, los_east_chunk, los_north_chunk)
+        (row_slice, (incidence_chunk, los_east_chunk, los_north_chunk))
     """
     (
         row_slice,
@@ -78,7 +78,7 @@ def _interp_chunk(args):
         vals_reshaped = vals.reshape(dem_chunk.shape).astype(np.float32)
         results.append(vals_reshaped)
 
-    return tuple(results)
+    return (row_slice, tuple(results))
 
 
 def prepare_geometry_layers(
