@@ -292,6 +292,7 @@ def _run_azimuth_blocked(
                 gslc_path=_first_non_compressed,
                 dem_path=pge_runconfig.dynamic_ancillary_file_group.dem_file,
                 output_dir=geometry_dir,
+                template_raster=_first_non_compressed,  # Use GSLC as template for exact frame grid
                 n_workers=cfg.worker_settings.n_parallel_bursts or 4,
             )
             layover_shadow_mask = geometry_layers.get("layover_shadow_mask")

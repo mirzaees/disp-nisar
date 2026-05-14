@@ -85,6 +85,7 @@ def prepare_geometry_layers(
     gslc_path: Filename,
     dem_path: Filename,
     output_dir: Path,
+    template_raster: Filename,
     incidence_output_name: str = "incidence_angle.tif",
     los_east_output_name: str = "los_east.tif",
     los_north_output_name: str = "los_north.tif",
@@ -92,26 +93,29 @@ def prepare_geometry_layers(
     chunk_size: int = 200,
     n_workers: int = 8,
 ) -> dict[str, Path]:
-    """Prepare geometry layers from GSLC radar grid and DEM at full resolution.
+    """Prepare geometry layers from GSLC radar grid and DEM at full frame resolution.
 
-    Creates geometry layers at the same resolution and grid as the input DEM,
-    which should match the GSLC resolution. These full-resolution layers are:
+    Creates geometry layers at the same exact grid as the GSLC frame (matching
+    the nodata mask and other frame-level products). These full-resolution layers are:
     - Used for masking during phase linking (layover/shadow)
     - Downsampled later for product generation (incidence angles, LOS)
 
     Computes:
-    - Incidence angle at surface (full resolution)
-    - LOS unit vectors east/north components (full resolution)
-    - Layover/shadow mask (full resolution, for use in block processing)
+    - Incidence angle at surface (full frame resolution)
+    - LOS unit vectors east/north components (full frame resolution)
+    - Layover/shadow mask (full frame resolution, for use in block processing)
 
     Parameters
     ----------
     gslc_path : Filename
         Path to NISAR GSLC HDF5 file containing radar grid metadata
     dem_path : Filename
-        Path to DEM file (GeoTIFF) at GSLC resolution
+        Path to DEM file (GeoTIFF)
     output_dir : Path
         Directory to save output files
+    template_raster : Filename
+        Template raster defining the target frame grid (e.g., a GSLC data layer)
+        Geometry layers will be created at this exact grid.
     incidence_output_name : str
         Output filename for incidence angle raster
     los_east_output_name : str
@@ -129,10 +133,10 @@ def prepare_geometry_layers(
     -------
     dict[str, Path]
         Dictionary with keys:
-        - 'incidence_angle': Path to incidence angle file (full resolution)
-        - 'los_east': Path to LOS east file (full resolution)
-        - 'los_north': Path to LOS north file (full resolution)
-        - 'layover_shadow_mask': Path to layover/shadow mask file (full resolution)
+        - 'incidence_angle': Path to incidence angle file (full frame resolution)
+        - 'los_east': Path to LOS east file (full frame resolution)
+        - 'los_north': Path to LOS north file (full frame resolution)
+        - 'layover_shadow_mask': Path to layover/shadow mask file (full frame resolution)
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -187,28 +191,27 @@ def prepare_geometry_layers(
         f"lat {min(lats):.2f}–{max(lats):.2f}"
     )
 
-    # Load DEM
-    logger.info(f"Loading DEM from {dem_path}")
-    dem_da = rxr.open_rasterio(dem_path, masked=True).squeeze()
-    dem_val = dem_da.values
-    dem_crs = dem_da.rio.crs
-
-    # Check DEM overlap with radar grid
-    t_to_rg = Transformer.from_crs(dem_crs, f"EPSG:{src_epsg}", always_xy=True)
-    dem_xs = [float(dem_da.x.min()), float(dem_da.x.max())]
-    dem_ys = [float(dem_da.y.min()), float(dem_da.y.max())]
-    dem_xs_rg, dem_ys_rg = t_to_rg.transform(dem_xs, dem_ys)
+    # Load template raster to get target frame grid
+    logger.info(f"Loading template raster to define output grid: {template_raster}")
+    template_da = rxr.open_rasterio(template_raster, masked=True).squeeze()
+    target_crs = template_da.rio.crs
+    target_shape = template_da.shape
     logger.info(
-        f"DEM in radar grid CRS: x {min(dem_xs_rg):.0f}–{max(dem_xs_rg):.0f}, "
-        f"y {min(dem_ys_rg):.0f}–{max(dem_ys_rg):.0f}"
+        f"Target frame grid: {target_shape[0]} x {target_shape[1]} pixels, "
+        f"CRS: {target_crs}"
     )
 
-    x_overlap = max(dem_xs_rg) > x_rg.min() and min(dem_xs_rg) < x_rg.max()
-    y_overlap = max(dem_ys_rg) > y_rg.min() and min(dem_ys_rg) < y_rg.max()
-    if not (x_overlap and y_overlap):
-        raise ValueError(
-            "DEM and radar grid do not overlap! Check that GSLC covers your area."
-        )
+    # Load and reproject DEM to match template grid
+    logger.info(f"Loading DEM from {dem_path}")
+    dem_src = rxr.open_rasterio(dem_path, masked=True).squeeze()
+
+    logger.info("Reprojecting DEM to match frame grid")
+    dem_da = dem_src.rio.reproject_match(template_da, resampling=Resampling.bilinear)
+    dem_val = dem_da.values
+    dem_crs = target_crs
+
+    # Clean up
+    del template_da, dem_src
 
     # Flip y-axis for interpolation (radar grid may be top-to-bottom)
     y_rg_flip = y_rg[::-1]
