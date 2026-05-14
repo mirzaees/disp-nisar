@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import NamedTuple, Sequence
 
 from dolphin import interferogram, io
-from dolphin._types import Bbox
+from dolphin._types import Bbox, Filename
 from dolphin.workflows import wrapped_phase
 from dolphin.workflows.config import DisplacementWorkflow
 from dolphin.workflows.displacement import OutputPaths
@@ -236,6 +236,52 @@ def build_full_frame_grid(
     )
 
 
+def _get_nisar_geotransform(
+    h5_file: Filename, frequency: str = "frequencyA"
+) -> tuple[float, float, float, float, float, float] | None:
+    """Read geotransform directly from NISAR HDF5 metadata.
+
+    GDAL's HDF5 driver returns an identity matrix for NISAR files, so we need
+    to read the coordinates directly from the multidimensional metadata.
+
+    Parameters
+    ----------
+    h5_file : Filename
+        Path to NISAR GSLC HDF5 file
+    frequency : str
+        Frequency band to use (default: "frequencyA")
+
+    Returns
+    -------
+    tuple | None
+        6-element geotransform (left, x_res, x_rot, top, y_rot, -y_res)
+        or None if metadata cannot be read
+    """
+    import h5py
+
+    try:
+        with h5py.File(h5_file, "r") as h5f:
+            grid_group = h5f[f"science/LSAR/GSLC/grids/{frequency}"]
+
+            x_coords = grid_group["xCoordinates"][:]
+            y_coords = grid_group["yCoordinates"][:]
+            x_spacing = float(grid_group["xCoordinateSpacing"][()])
+            y_spacing = float(grid_group["yCoordinateSpacing"][()])
+
+            # NISAR coordinates are pixel centers
+            # Geotransform origin is top-left corner
+            left = float(x_coords.min()) - abs(x_spacing) / 2
+            top = float(y_coords.max()) + abs(y_spacing) / 2
+
+            # Standard geotransform: (left, x_res, x_rot, top, y_rot, -y_res)
+            # Note: y_spacing is negative for north-up orientation
+            return (left, abs(x_spacing), 0.0, top, 0.0, -abs(y_spacing))
+
+    except Exception as e:
+        logger.debug(f"Could not read NISAR geotransform from {h5_file}: {e}")
+        return None
+
+
 def load_grid_from_nisar_gslc(
     gslc_path: object, subdataset: str | None, epsg: int
 ) -> FullFrameGrid:
@@ -251,21 +297,26 @@ def load_grid_from_nisar_gslc(
     often lack an ``AUTHORITY`` tag and can defeat ``AutoIdentifyEPSG``.
     """
     from osgeo import gdal
-    from opera_utils import get_geotransform_from_nisar
 
     src_str = str(gslc_path)
 
-    # Try to get geotransform using opera-utils (handles NISAR multidim metadata)
+    # Try to get geotransform from NISAR HDF5 metadata (handles NISAR properly)
     gt = None
-    try:
-        result = get_geotransform_from_nisar(src_str, dataset_name=subdataset)
-        if result is not None:
-            gt, _projection = result
-            logger.debug(f"Got geotransform from NISAR multidim API: {gt}")
-    except Exception as e:
-        logger.debug(f"Could not get geotransform via opera-utils: {e}")
+    frequency = "frequencyA"
+    if subdataset:
+        # Extract frequency from subdataset path if present
+        if "frequency" in subdataset.lower():
+            for part in subdataset.split("/"):
+                if part.startswith("frequency"):
+                    frequency = part
+                    break
 
-    # Fallback to standard GDAL if opera-utils didn't work
+    if src_str.lower().endswith((".h5", ".hdf5")):
+        gt = _get_nisar_geotransform(src_str, frequency=frequency)
+        if gt is not None:
+            logger.debug(f"Got geotransform from NISAR metadata: {gt}")
+
+    # Fallback to standard GDAL if direct HDF5 read didn't work
     if gt is None or tuple(gt) == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
         logger.debug("Falling back to standard GDAL GetGeoTransform")
         if subdataset and src_str.lower().endswith((".h5", ".hdf5", ".nc")):
@@ -282,7 +333,7 @@ def load_grid_from_nisar_gslc(
         finally:
             ds = None
     else:
-        # Got valid geotransform from opera-utils, now get dimensions
+        # Got valid geotransform from HDF5 metadata, now get dimensions via GDAL
         if subdataset and src_str.lower().endswith((".h5", ".hdf5", ".nc")):
             uri = f'HDF5:"{src_str}"://{subdataset.lstrip("/")}'
         else:
