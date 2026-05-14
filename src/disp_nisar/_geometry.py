@@ -91,16 +91,19 @@ def prepare_geometry_layers(
     chunk_size: int = 200,
     n_workers: int = 8,
 ) -> dict[str, Path]:
-    """Prepare geometry layers from GSLC radar grid and DEM at full frame resolution.
+    """Prepare geometry layers from GSLC radar grid and DEM (memory-optimized).
 
-    Creates geometry layers at the same exact grid as the GSLC frame (matching
-    the nodata mask and other frame-level products). These full-resolution layers are:
-    - Used for masking during phase linking (layover/shadow)
-    - Downsampled later for product generation (incidence angles, LOS)
+    Memory-efficient approach:
+    - Reprojects DEM to target CRS at **native resolution** (no resampling, faster)
+    - Interpolates geometry at **DEM native resolution** (smaller arrays, less memory)
+    - Saves layover/shadow mask at **full frame resolution** (to match other masks)
+    - Saves inc/LOS at **DEM native resolution** (downsampled later to product resolution)
+
+    This avoids creating large full-frame geometry arrays when unnecessary.
 
     Computes:
-    - Incidence angle at surface (full frame resolution)
-    - LOS unit vectors east/north components (full frame resolution)
+    - Incidence angle at surface (DEM native resolution)
+    - LOS unit vectors east/north components (DEM native resolution)
     - Layover/shadow mask (full frame resolution, for use in block processing)
 
     Parameters
@@ -112,8 +115,8 @@ def prepare_geometry_layers(
     output_dir : Path
         Directory to save output files
     template_raster : Filename
-        Template raster defining the target frame grid (e.g., a GSLC data layer)
-        Geometry layers will be created at this exact grid.
+        Template raster defining the target frame bounds and CRS.
+        Layover/shadow mask will match this grid, but inc/LOS use DEM native resolution.
     incidence_output_name : str
         Output filename for incidence angle raster
     los_east_output_name : str
@@ -131,9 +134,9 @@ def prepare_geometry_layers(
     -------
     dict[str, Path]
         Dictionary with keys:
-        - 'incidence_angle': Path to incidence angle file (full frame resolution)
-        - 'los_east': Path to LOS east file (full frame resolution)
-        - 'los_north': Path to LOS north file (full frame resolution)
+        - 'incidence_angle': Path to incidence angle file (DEM native resolution)
+        - 'los_east': Path to LOS east file (DEM native resolution)
+        - 'los_north': Path to LOS north file (DEM native resolution)
         - 'layover_shadow_mask': Path to layover/shadow mask file (full frame resolution)
     """
     output_dir = Path(output_dir)
@@ -189,43 +192,38 @@ def prepare_geometry_layers(
         f"lat {min(lats):.2f}–{max(lats):.2f}"
     )
 
-    # Load template raster to get target frame grid
-    logger.info(f"Loading template raster to define output grid: {template_raster}")
+    # Load template raster to get target frame bounds and CRS
+    logger.info(f"Loading template raster to get target bounds: {template_raster}")
     template_da = rxr.open_rasterio(template_raster, masked=True).squeeze()
     target_crs = template_da.rio.crs
-    target_shape = template_da.shape
+    target_bounds = template_da.rio.bounds()
+    frame_shape = template_da.shape  # Save for layover/shadow mask later
+    frame_transform = template_da.rio.transform()
     logger.info(
-        f"Target frame grid: {target_shape[0]} x {target_shape[1]} pixels, "
-        f"CRS: {target_crs}"
+        f"Target frame: {frame_shape[0]} x {frame_shape[1]} pixels, "
+        f"CRS: {target_crs}, bounds: {target_bounds}"
     )
 
-    # Reproject DEM using fast GDAL warp (cached on disk)
-    logger.info(f"Reprojecting DEM from {dem_path}")
-    reprojected_dem_path = output_dir / "dem_reprojected.tif"
+    # Reproject DEM to target CRS/bounds but keep NATIVE RESOLUTION (memory efficient)
+    logger.info(f"Reprojecting DEM from {dem_path} (keeping native resolution)")
+    reprojected_dem_path = output_dir / "dem_reprojected_native.tif"
 
     if reprojected_dem_path.exists():
         logger.info(f"Using cached reprojected DEM: {reprojected_dem_path}")
     else:
         from osgeo import gdal
 
-        # Get template bounds and resolution
-        bounds = template_da.rio.bounds()
-        gt = template_da.rio.transform()
-        x_res = gt.a
-        y_res = -gt.e  # Negative because gt.e is negative for north-up
-
         logger.info(
-            f"Warping DEM to match frame: {target_shape[1]}x{target_shape[0]}, "
-            f"resolution: {x_res:.2f}m"
+            f"Warping DEM to target CRS/bounds at native resolution "
+            f"(no resampling for memory efficiency)"
         )
 
-        # Use GDAL warp (much faster than rioxarray for large DEMs)
+        # Use GDAL warp WITHOUT xRes/yRes - keeps native DEM resolution
         warp_options = gdal.WarpOptions(
             format="GTiff",
             dstSRS=str(target_crs),
-            outputBounds=(bounds[0], bounds[1], bounds[2], bounds[3]),
-            xRes=x_res,
-            yRes=y_res,
+            outputBounds=(target_bounds[0], target_bounds[1], target_bounds[2], target_bounds[3]),
+            # NO xRes/yRes = keep native resolution!
             resampleAlg="bilinear",
             creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"],
             multithread=True,
@@ -235,10 +233,17 @@ def prepare_geometry_layers(
         gdal.Warp(str(reprojected_dem_path), str(dem_path), options=warp_options)
         logger.info(f"Saved reprojected DEM to {reprojected_dem_path}")
 
-    # Load the reprojected DEM
+    # Load the reprojected DEM at native resolution
     dem_da = rxr.open_rasterio(reprojected_dem_path, masked=True).squeeze()
     dem_val = dem_da.values
     dem_crs = target_crs
+    dem_shape = dem_da.shape
+    dem_gt = dem_da.rio.transform()
+
+    logger.info(
+        f"DEM native resolution: {dem_shape[0]} x {dem_shape[1]} pixels, "
+        f"pixel size: {dem_gt.a:.2f}m x {-dem_gt.e:.2f}m"
+    )
 
     # Clean up
     del template_da
@@ -292,8 +297,8 @@ def prepare_geometry_layers(
         np.clip(1.0 - los_east_surf**2 - los_north_surf**2, 0, None)
     ).astype("float32")
 
-    # Save all geometry layers at DEM (full) resolution using fast GDAL writes
-    logger.info("Saving geometry layers at full resolution (DEM grid)")
+    # Save geometry layers at DEM native resolution using fast GDAL writes
+    logger.info(f"Saving geometry layers at DEM native resolution: {dem_shape[0]}x{dem_shape[1]}")
 
     from osgeo import gdal, osr
 
@@ -350,28 +355,63 @@ def prepare_geometry_layers(
         f"  LOS north range: {np.nanmin(los_north_surf):.3f}–{np.nanmax(los_north_surf):.3f}"
     )
 
-    # Compute and save layover/shadow mask
-    logger.info("Computing layover/shadow mask")
-    layover_shadow_mask = _compute_layover_shadow_mask(
+    # Compute layover/shadow mask at DEM native resolution
+    logger.info("Computing layover/shadow mask at DEM native resolution")
+    layover_shadow_mask_native = _compute_layover_shadow_mask(
         inc_surface, dem_matched=dem_val
     )
+    pct_bad = 100 * (1 - layover_shadow_mask_native.mean())
+    logger.info(f"  {pct_bad:.1f}% pixels masked as layover/shadow at native res")
 
-    # Save as uint8: 0=bad (layover/shadow), 1=good
+    # Resample layover/shadow mask to FULL FRAME RESOLUTION (to match other masks)
+    logger.info(
+        f"Resampling layover/shadow mask to full frame resolution: "
+        f"{frame_shape[0]}x{frame_shape[1]}"
+    )
+    layover_shadow_native_path = output_dir / "layover_shadow_native.tif"
     _write_geotiff_fast(
-        layover_shadow_mask.astype(np.uint8),
-        layover_shadow_path,
+        layover_shadow_mask_native.astype(np.uint8),
+        layover_shadow_native_path,
         gdal.GDT_Byte,
         nodata=255,
     )
-    logger.info(f"Saved layover/shadow mask to {layover_shadow_path}")
-    pct_bad = 100 * (1 - layover_shadow_mask.mean())
-    logger.info(f"  {pct_bad:.1f}% pixels masked as layover/shadow")
+
+    # Use GDAL warp to resample to frame resolution (nearest neighbor for binary mask)
+    from osgeo import gdal
+
+    warp_options = gdal.WarpOptions(
+        format="GTiff",
+        dstSRS=str(dem_crs),
+        outputBounds=(target_bounds[0], target_bounds[1], target_bounds[2], target_bounds[3]),
+        width=frame_shape[1],
+        height=frame_shape[0],
+        resampleAlg="near",  # Nearest neighbor for binary mask
+        creationOptions=["COMPRESS=LZW", "TILED=YES"],
+        multithread=True,
+    )
+
+    gdal.Warp(
+        str(layover_shadow_path),
+        str(layover_shadow_native_path),
+        options=warp_options,
+    )
+    logger.info(f"Saved layover/shadow mask at full frame resolution to {layover_shadow_path}")
+
+    # Clean up temporary file
+    layover_shadow_native_path.unlink(missing_ok=True)
+
+    logger.info(
+        "Geometry preparation complete:\n"
+        f"  - Incidence/LOS: DEM native resolution ({dem_shape[0]}x{dem_shape[1]})\n"
+        f"  - Layover/shadow mask: Full frame resolution ({frame_shape[0]}x{frame_shape[1]})\n"
+        "  - Incidence/LOS will be downsampled to product resolution later"
+    )
 
     return {
-        "incidence_angle": incidence_path,
-        "los_east": los_east_path,
-        "los_north": los_north_path,
-        "layover_shadow_mask": layover_shadow_path,
+        "incidence_angle": incidence_path,  # DEM native resolution
+        "los_east": los_east_path,  # DEM native resolution
+        "los_north": los_north_path,  # DEM native resolution
+        "layover_shadow_mask": layover_shadow_path,  # Full frame resolution
     }
 
 
@@ -382,18 +422,21 @@ def downsample_geometry_for_products(
     reference_raster: Filename,
     output_dir: Path,
 ) -> dict[str, Path]:
-    """Downsample full-resolution geometry layers to match product grid.
+    """Downsample geometry layers from DEM native resolution to product grid.
+
+    Takes geometry at DEM native resolution (from prepare_geometry_layers) and
+    resamples to match the strided product grid for use in displacement products.
 
     Parameters
     ----------
     incidence_angle_path : Path
-        Path to full-resolution incidence angle raster
+        Path to incidence angle raster at DEM native resolution
     los_east_path : Path
-        Path to full-resolution LOS east raster
+        Path to LOS east raster at DEM native resolution
     los_north_path : Path
-        Path to full-resolution LOS north raster
+        Path to LOS north raster at DEM native resolution
     reference_raster : Filename
-        Reference raster defining the target grid (e.g., unwrapped phase product)
+        Reference raster defining the target product grid (e.g., unwrapped phase product)
     output_dir : Path
         Directory to save downsampled geometry layers
 
@@ -401,9 +444,9 @@ def downsample_geometry_for_products(
     -------
     dict[str, Path]
         Dictionary with keys:
-        - 'incidence_angle': Path to downsampled incidence angle
-        - 'los_east': Path to downsampled LOS east
-        - 'los_north': Path to downsampled LOS north
+        - 'incidence_angle': Path to downsampled incidence angle (product resolution)
+        - 'los_east': Path to downsampled LOS east (product resolution)
+        - 'los_north': Path to downsampled LOS north (product resolution)
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
