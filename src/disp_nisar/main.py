@@ -788,16 +788,52 @@ def process_product(
 
     corrections = {}
 
-    if files.ionosphere is not None:
-        warped_iono = stitching.warp_to_match(
-            files.ionosphere, files.unwrapped, resample_alg="bilinear"
-        )
-        iono_radians = io.load_gdal(warped_iono)
-        iono_radians *= wavelength / (4.0 * np.pi)
-        corrections["ionosphere"] = iono_radians
+    if files.ionosphere is not None and Path(files.ionosphere).exists():
+        logger.info(f"Loading ionosphere correction from {files.ionosphere}")
+        try:
+            # Check if ionosphere file has valid data
+            iono_data = io.load_gdal(files.ionosphere, masked=True)
+            valid_count = np.count_nonzero(~np.isnan(iono_data)) if iono_data.size > 0 else 0
+
+            if valid_count == 0:
+                logger.warning(
+                    f"Ionosphere file {files.ionosphere} is empty or all NaN. "
+                    "Skipping ionosphere correction."
+                )
+            else:
+                logger.info(
+                    f"Ionosphere file has {valid_count}/{iono_data.size} valid pixels "
+                    f"({100*valid_count/iono_data.size:.1f}%)"
+                )
+                warped_iono = stitching.warp_to_match(
+                    files.ionosphere, files.unwrapped, resample_alg="bilinear"
+                )
+                iono_radians = io.load_gdal(warped_iono, masked=True)
+                valid_warped = np.count_nonzero(~np.isnan(iono_radians))
+                logger.info(
+                    f"Warped ionosphere has {valid_warped}/{iono_radians.size} valid pixels "
+                    f"({100*valid_warped/iono_radians.size:.1f}%)"
+                )
+
+                if valid_warped > 0:
+                    # Convert from phase (radians) to displacement (meters)
+                    iono_radians *= wavelength / (4.0 * np.pi)
+                    corrections["ionosphere"] = iono_radians
+                    logger.info("Ionosphere correction added to corrections dict")
+                else:
+                    logger.warning(
+                        "Warped ionosphere has no valid pixels. Skipping ionosphere correction."
+                    )
+        except Exception as e:
+            logger.warning(
+                f"Failed to load ionosphere correction from {files.ionosphere}: {e}",
+                exc_info=True,
+            )
     else:
-        logger.warning(
-            "Missing ionospheric correction for %s. Creating empty layer.",
+        if files.ionosphere is not None:
+            logger.warning(f"Ionosphere file {files.ionosphere} does not exist.")
+        logger.debug(
+            "No ionospheric correction for %s. Product will not include ionosphere correction.",
             files.unwrapped,
         )
 

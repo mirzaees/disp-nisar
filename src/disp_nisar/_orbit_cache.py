@@ -65,77 +65,13 @@ def _get_look_side_from_file(h5file: Filename) -> str:
         return "Right"
 
 
-def _convert_to_json_serializable(data):
-    """Convert HDF5 data to JSON-serializable format.
-
-    Handles various numpy types, nested structures, and special cases.
-    """
-    # Handle None
-    if data is None:
-        return None
-
-    # Handle bytes
-    if isinstance(data, bytes):
-        return data.decode("utf-8")
-
-    # Handle numpy scalar types
-    if isinstance(data, (np.integer, np.floating)):
-        return data.item()
-
-    # Handle numpy arrays
-    if isinstance(data, np.ndarray):
-        # Empty array
-        if data.size == 0:
-            return []
-
-        # String/bytes arrays
-        if data.dtype.kind in ('U', 'S', 'O'):
-            # Flatten and convert each element
-            flat_list = []
-            for item in data.flat:
-                if isinstance(item, bytes):
-                    flat_list.append(item.decode("utf-8"))
-                elif isinstance(item, str):
-                    flat_list.append(item)
-                else:
-                    flat_list.append(str(item))
-
-            # Return scalar if single element, else shaped list
-            if data.size == 1:
-                return flat_list[0]
-            else:
-                # Reshape to original shape
-                return np.array(flat_list).reshape(data.shape).tolist()
-
-        # Numeric arrays - convert to list
-        return data.tolist()
-
-    # Handle strings
-    if isinstance(data, str):
-        return data
-
-    # Handle lists/tuples recursively
-    if isinstance(data, (list, tuple)):
-        return [_convert_to_json_serializable(item) for item in data]
-
-    # Handle dicts recursively
-    if isinstance(data, dict):
-        return {key: _convert_to_json_serializable(val) for key, val in data.items()}
-
-    # For other types, try to convert to string
-    try:
-        return str(data)
-    except Exception:
-        return None
-
-
 def _extract_hdf5_metadata(h5file: Filename) -> dict:
     """Extract metadata datasets from NISAR GSLC file.
 
     Returns
     -------
     dict
-        Dictionary mapping dataset paths to their values (as JSON-serializable types)
+        Dictionary mapping dataset paths to their values (as strings or arrays)
     """
     metadata = {}
     with h5py.File(h5file, "r") as hf:
@@ -143,8 +79,13 @@ def _extract_hdf5_metadata(h5file: Filename) -> dict:
             if dset_path in hf:
                 try:
                     data = hf[dset_path][()]
-                    converted = _convert_to_json_serializable(data)
-                    metadata[dset_path] = converted
+                    # Convert bytes to string
+                    if isinstance(data, bytes):
+                        data = data.decode("utf-8")
+                    # Convert numpy arrays to lists for JSON serialization
+                    elif isinstance(data, np.ndarray):
+                        data = data.tolist()
+                    metadata[dset_path] = data
                 except Exception as e:
                     logger.debug(f"Could not extract {dset_path}: {e}")
     return metadata
@@ -521,35 +462,16 @@ def copy_cached_metadata_to_file(
             if full_path in dst:
                 del dst[full_path]
 
-            # Recreate the dataset with proper type handling
+            # Recreate the dataset
             try:
                 if isinstance(data, str):
-                    # String scalar
-                    dst.create_dataset(full_path, data=np.string_(data))
+                    dst.create_dataset(full_path, data=np.bytes_(data))
                 elif isinstance(data, list):
                     # Array data - reconstruct as numpy array
                     arr = np.array(data)
-
-                    # Check if it's a string array (nested structure of strings)
-                    if arr.dtype.kind in ('U', 'O'):
-                        # String array - use h5py string dtype
-                        dst.create_dataset(
-                            full_path,
-                            data=arr.astype('S'),  # Convert to bytes
-                            dtype=h5py.string_dtype('utf-8')
-                        )
-                    else:
-                        # Numeric array
-                        dst.create_dataset(full_path, data=arr)
-                elif isinstance(data, (int, float, bool)):
-                    # Python scalar types
-                    dst.create_dataset(full_path, data=data)
-                elif data is None:
-                    # Skip None values
-                    logger.debug(f"Skipping None value for {dset_path}")
-                    continue
+                    dst.create_dataset(full_path, data=arr)
                 else:
-                    # Try generic conversion
+                    # Scalar value
                     dst.create_dataset(full_path, data=data)
                 copied_count += 1
             except Exception as e:

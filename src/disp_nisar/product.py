@@ -247,9 +247,23 @@ def create_output_product(
     iono_arr = corrections.get("ionosphere") if corrections else None
     if iono_arr is not None:
         iono_arr = np.asarray(iono_arr, dtype=np.float32)
-        if reference_point is not None:
-            iono_arr -= iono_arr[reference_point.row, reference_point.col]
-        disp_arr -= iono_arr
+        # Check if ionosphere correction is valid
+        if np.all(np.isnan(iono_arr)):
+            logger.warning(
+                "Ionosphere correction is all NaN, skipping ionosphere correction"
+            )
+        elif np.any(~np.isnan(iono_arr)):
+            # Apply correction only if there are valid values
+            if reference_point is not None:
+                ref_iono = iono_arr[reference_point.row, reference_point.col]
+                if not np.isnan(ref_iono):
+                    iono_arr -= ref_iono
+            # Subtract ionosphere using nansum-like behavior to preserve valid displacement values
+            # Only subtract where ionosphere is not NaN
+            disp_arr = np.where(np.isnan(iono_arr), disp_arr, disp_arr - iono_arr)
+            logger.info(
+                f"Applied ionosphere correction: {np.count_nonzero(~np.isnan(iono_arr))} valid pixels"
+            )
         del iono_arr
         gc.collect()
 
