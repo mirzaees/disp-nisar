@@ -40,6 +40,66 @@ NISAR_METADATA_PATHS = [
 ]
 
 
+def _convert_to_json_serializable(data):
+    """Convert HDF5 data to JSON-serializable format.
+
+    Parameters
+    ----------
+    data : any
+        Data from HDF5 dataset (numpy arrays, scalars, strings, etc.)
+
+    Returns
+    -------
+    any
+        JSON-serializable version of the input data
+    """
+    if data is None:
+        return None
+
+    # Handle bytes
+    if isinstance(data, bytes):
+        return data.decode("utf-8")
+
+    # Handle numpy scalar types (uint32, int64, float64, etc.)
+    if isinstance(data, (np.integer, np.floating)):
+        return data.item()
+
+    # Handle numpy arrays
+    if isinstance(data, np.ndarray):
+        if data.size == 0:
+            return []
+
+        # String/bytes arrays
+        if data.dtype.kind in ("U", "S", "O"):
+            flat_list = []
+            for item in data.flat:
+                if isinstance(item, bytes):
+                    flat_list.append(item.decode("utf-8"))
+                elif isinstance(item, str):
+                    flat_list.append(item)
+                else:
+                    flat_list.append(str(item))
+
+            if data.size == 1:
+                return flat_list[0]
+            else:
+                return np.array(flat_list).reshape(data.shape).tolist()
+
+        # Numeric arrays - convert to list
+        return data.tolist()
+
+    # Handle lists/tuples recursively
+    if isinstance(data, (list, tuple)):
+        return [_convert_to_json_serializable(item) for item in data]
+
+    # Handle dictionaries recursively
+    if isinstance(data, dict):
+        return {key: _convert_to_json_serializable(value) for key, value in data.items()}
+
+    # For Python native types (int, float, str, bool), return as-is
+    return data
+
+
 def _get_look_side_from_file(h5file: Filename) -> str:
     """Get the look side from a NISAR GSLC HDF5 file.
 
@@ -79,13 +139,8 @@ def _extract_hdf5_metadata(h5file: Filename) -> dict:
             if dset_path in hf:
                 try:
                     data = hf[dset_path][()]
-                    # Convert bytes to string
-                    if isinstance(data, bytes):
-                        data = data.decode("utf-8")
-                    # Convert numpy arrays to lists for JSON serialization
-                    elif isinstance(data, np.ndarray):
-                        data = data.tolist()
-                    metadata[dset_path] = data
+                    # Use the comprehensive conversion function
+                    metadata[dset_path] = _convert_to_json_serializable(data)
                 except Exception as e:
                     logger.debug(f"Could not extract {dset_path}: {e}")
     return metadata
