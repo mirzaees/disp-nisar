@@ -346,9 +346,33 @@ def read_ionosphere_phase_screen(
     output_dir = output_timeseries_files[0].parent / "ionosphere"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Format the GUNW .h5 file as a GDAL-readable NETCDF subdataset path so that
-    # io.write_arr can copy the ionosphere layer's CRS and geotransform.
-    gunw_iono_gdal_path = format_nc_filename(valid_gunw_files[0], iono_path)
+    # Extract geotransform and projection from GUNW HDF5 file
+    with h5py.File(valid_gunw_files[0], "r") as f:
+        # Get coordinate arrays
+        coord_base = f"/science/LSAR/GUNW/grids/{frequency}/unwrappedInterferogram/{polarization}"
+        x_coords = f[f"{coord_base}/xCoordinates"][:]
+        y_coords = f[f"{coord_base}/yCoordinates"][:]
+
+        # Read projection - could be EPSG code or WKT string
+        projection_data = f[f"{coord_base}/projection"][()]
+        if isinstance(projection_data, (int, np.integer)):
+            # It's an EPSG code
+            gunw_projection = int(projection_data)
+            logger.info(f"GUNW projection EPSG: {gunw_projection}")
+        else:
+            # It's a WKT string
+            gunw_projection = projection_data.decode() if isinstance(projection_data, bytes) else str(projection_data)
+            logger.info(f"GUNW projection WKT: {gunw_projection[:100]}...")
+
+        # Build geotransform from coordinates
+        # Geotransform: (x_origin, x_pixel_size, 0, y_origin, 0, y_pixel_size)
+        x_origin = float(x_coords[0])
+        y_origin = float(y_coords[0])
+        x_pixel_size = float(x_coords[1] - x_coords[0]) if len(x_coords) > 1 else 1.0
+        y_pixel_size = float(y_coords[1] - y_coords[0]) if len(y_coords) > 1 else 1.0
+        gunw_geotransform = (x_origin, x_pixel_size, 0.0, y_origin, 0.0, y_pixel_size)
+
+    logger.info(f"GUNW geotransform: {gunw_geotransform}")
 
     # Build (out_file, tmp_path, out_path, ts_idx) for every requested output date.
     # tmp_path is a GeoTIFF on the GUNW grid; out_path is the final
@@ -377,12 +401,14 @@ def read_ionosphere_phase_screen(
             )
             continue
         io.write_arr(
-            arr=None,
-            like_filename=gunw_iono_gdal_path,
+            arr=np.full((rows, cols), np.nan, dtype=np.float32),
             output_name=tmp_path,
             dtype="float32",
             nodata=np.nan,
             units="radians",
+            geotransform=gunw_geotransform,
+            projection=gunw_projection,
+            options=["COMPRESS=NONE", "TILED=NO", "BIGTIFF=IF_SAFER"],
         )
         created_tmp_paths.add(tmp_path)
 

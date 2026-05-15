@@ -1821,6 +1821,11 @@ def _create_yx_arrays(
     # is the upper left corner of the top left pixel.
     y = np.arange(y_origin + y_res / 2, y_origin + y_res * ysize, y_res)
     x = np.arange(x_origin + x_res / 2, x_origin + x_res * xsize, x_res)
+
+    # Reverse y-coordinates to match NetCDF convention (increasing order)
+    # GeoTIFF uses decreasing y-coords (north to south), NetCDF prefers increasing (south to north)
+    y = y[::-1]
+
     return y, x
 
 
@@ -2084,6 +2089,62 @@ def _copy_hdf5_dsets(
                 src.copy(src[dset_path], dst[out_group], name=new_name)
 
 
+def _write_orbit_from_cache(
+    cache_dir: Path,
+    cslc_filename: Filename,
+    output_file: Filename,
+    orbit_group_path: str = "/science/LSAR/GSLC/metadata/orbit",
+) -> None:
+    """Write orbit data from cache to HDF5 file.
+
+    Parameters
+    ----------
+    cache_dir : Path
+        Directory containing cached orbit files
+    cslc_filename : Filename
+        Original CSLC filename (used to find matching cache)
+    output_file : Filename
+        Path to output HDF5 file
+    orbit_group_path : str
+        Path to orbit group in HDF5 file (default: "/science/LSAR/GSLC/metadata/orbit")
+    """
+    from ._orbit_cache import load_orbit_data
+
+    # Load orbit data from cache
+    orbit_data = load_orbit_data(cache_dir, cslc_filename)
+    if orbit_data is None:
+        raise FileNotFoundError(
+            f"Could not load cached orbit data for {cslc_filename}. "
+            f"Ensure orbit cache was generated at workflow start."
+        )
+
+    times = orbit_data["times"]
+    positions = orbit_data["positions"]
+    velocities = orbit_data["velocities"]
+    reference_epoch = orbit_data["reference_epoch"]
+
+    # Write orbit data to HDF5 file
+    with h5py.File(output_file, "a") as dst:
+        # Create orbit group if it doesn't exist
+        orbit_group = dst.require_group(orbit_group_path)
+
+        # Delete existing datasets if they exist
+        for dset_name in ["time", "position", "velocity"]:
+            if dset_name in orbit_group:
+                del orbit_group[dset_name]
+
+        # Write time dataset with units attribute
+        time_dset = orbit_group.create_dataset("time", data=times)
+        units_str = f"seconds since {reference_epoch.isoformat()}"
+        time_dset.attrs["units"] = np.bytes_(units_str)
+
+        # Write position and velocity datasets
+        orbit_group.create_dataset("position", data=positions)
+        orbit_group.create_dataset("velocity", data=velocities)
+
+    logger.debug(f"Wrote orbit data from cache to {output_file}")
+
+
 def copy_cslc_metadata_to_compressed(
     opera_cslc_file: Filename,
     output_hdf5_file: Filename,
@@ -2135,15 +2196,16 @@ def copy_cslc_metadata_to_compressed(
                 dsets_to_copy=dsets_to_copy,
             )
 
-            # Copy orbit group directly from file (complex structure)
+            # Write orbit group from cache instead of opening CSLC file
             try:
-                _copy_hdf5_dsets(
-                    source_file=opera_cslc_file,
-                    dest_file=output_hdf5_file,
-                    dsets_to_copy=[(orbit_group, None)],
+                _write_orbit_from_cache(
+                    cache_dir=cache_dir,
+                    cslc_filename=opera_cslc_file,
+                    output_file=output_hdf5_file,
+                    orbit_group_path=orbit_group,
                 )
             except Exception as e:
-                logger.warning(f"Failed to copy orbit group: {e}")
+                logger.warning(f"Failed to write orbit group from cache: {e}")
 
             logger.debug(
                 f"Copied metadata from cache to {output_hdf5_file} for {opera_cslc_file}"
