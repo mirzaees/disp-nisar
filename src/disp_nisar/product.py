@@ -458,6 +458,7 @@ def create_output_product(
 
     # Fill ancillary datasets one strip at a time to avoid multi-GiB allocations
     xsize = shape[1]
+    ysize = shape[0]
     with h5py.File(output_name, "a") as hf:
         for info, filename in blockwise_writes:
             dset = hf[f"/{info.name}"]
@@ -468,7 +469,12 @@ def create_output_product(
                 block = block.astype(info.dtype)
                 if info.keep_bits is not None:
                     round_mantissa(block, keep_bits=info.keep_bits)
-                dset[row_slice, :] = block
+                # Flip block and calculate flipped row position to match reversed y-coordinates
+                block = block[::-1, :]
+                flipped_start = ysize - row_slice.stop
+                flipped_stop = ysize - row_slice.start
+                flipped_slice = slice(flipped_start, flipped_stop)
+                dset[flipped_slice, :] = block
 
     # Compute baseline now (after displacement/mask arrays are freed) to avoid
     # holding a full-size float32 in memory during the filtering step above.
@@ -1788,12 +1794,18 @@ def _create_geo_dataset(
     y_name: str = "y",
     grid_mapping_dset_name=GRID_MAPPING_DSET,
 ) -> h5netcdf.Variable:
+    # Flip data in y-direction to match reversed y-coordinates
+    # GeoTIFF has decreasing y-coords (north->south), NetCDF has increasing y-coords (south->north)
     if include_time:
         dimensions = ["time", y_name, x_name]
         if data.ndim == 2:
-            data = data[np.newaxis, :, :]
+            data = data[np.newaxis, ::-1, :]
+        else:
+            data = data[:, ::-1, :]
     else:
         dimensions = [y_name, x_name]
+        data = data[::-1, :]
+
     dset = _create_dataset(
         group=group,
         name=name,
@@ -1823,7 +1835,7 @@ def _create_yx_arrays(
     x = np.arange(x_origin + x_res / 2, x_origin + x_res * xsize, x_res)
 
     # Reverse y-coordinates to match NetCDF convention (increasing order)
-    # GeoTIFF uses decreasing y-coords (north to south), NetCDF prefers increasing (south to north)
+    # This reversal is paired with flipping data arrays in _create_geo_dataset
     y = y[::-1]
 
     return y, x
@@ -2024,14 +2036,21 @@ def process_compressed_slc(info: CompressedSLCInfo) -> Path:
                 np.complex64
             )
             round_mantissa(slc_block, keep_bits=10)
-            slc_dset[row_slice, :] = slc_block
+            # Flip block and calculate flipped row position to match reversed y-coordinates
+            slc_block = slc_block[::-1, :]
+            flipped_start = ysize - row_slice.stop
+            flipped_stop = ysize - row_slice.start
+            flipped_slice = slice(flipped_start, flipped_stop)
+            slc_dset[flipped_slice, :] = slc_block
 
             # Band 2: amplitude dispersion
             disp_block = io.load_gdal(
                 comp_slc_file, band=2, rows=row_slice
             ).real.astype(np.float32)
             round_mantissa(disp_block, keep_bits=10)
-            disp_dset[row_slice, :] = disp_block
+            # Flip block to match reversed y-coordinates
+            disp_block = disp_block[::-1, :]
+            disp_dset[flipped_slice, :] = disp_block
 
     # Try to use orbit cache if available - look for it in parent directories
     # The cache is created at workflow start in work_directory/orbit_cache
