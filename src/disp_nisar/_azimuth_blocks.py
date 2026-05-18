@@ -179,6 +179,7 @@ def block_bounds(frame: FullFrameGrid, block: BlockWindow) -> Bbox:
     -------
     Bbox
         Bounding box in projected coordinates (meters or degrees depending on EPSG)
+
     """
     # Get geotransform components
     gt = frame.geotransform
@@ -256,6 +257,7 @@ def _get_nisar_geotransform(
     tuple | None
         6-element geotransform (left, x_res, x_rot, top, y_rot, -y_res)
         or None if metadata cannot be read
+
     """
     import h5py
 
@@ -520,6 +522,7 @@ def _crop_frame_mask_to_block(
     -------
     Path
         Path to the cropped mask file
+
     """
     from osgeo import gdal
 
@@ -594,6 +597,7 @@ def _stage_input_to_local(
     -------
     Path
         Path to the staged GTiff with correct projection information
+
     """
     from osgeo import gdal
 
@@ -699,23 +703,24 @@ def _stage_inputs_for_block(
     -------
     tuple[list[Path], str | None]
         Staged file paths and new subdataset value
+
     """
     staging_dir.mkdir(parents=True, exist_ok=True)
     subdataset = cfg.input_options.subdataset
     staged: list[Path] = []
-    # any_staged = False
+    any_staged = False
     for src in cfg.cslc_file_list:
-        staged.append(
-            _stage_input_to_local(str(src), subdataset, block, staging_dir, frame)
-        )
-        # if _is_remote_path(src):
-        #     any_staged = True
-        #     staged.append(
-        #         _stage_input_to_local(str(src), subdataset, block, staging_dir, frame)
-        #     )
-        # else:
-        #     staged.append(Path(src))
-    new_subdataset = None  # if any_staged else subdataset
+        # staged.append(
+        #     _stage_input_to_local(str(src), subdataset, block, staging_dir, frame)
+        # )
+        if _is_remote_path(src):
+            any_staged = True
+            staged.append(
+                _stage_input_to_local(str(src), subdataset, block, staging_dir, frame)
+            )
+        else:
+            staged.append(Path(src))
+    new_subdataset = None if any_staged else subdataset
     return staged, new_subdataset
 
 
@@ -770,7 +775,9 @@ def run_phase_linking_block(
             staged_files[0],
         )
         block_nodata_mask = block_work_dir / "nodata_mask.tif"
-        _crop_frame_mask_to_block(frame_nodata_mask, template, block, block_nodata_mask, frame)
+        _crop_frame_mask_to_block(
+            frame_nodata_mask, template, block, block_nodata_mask, frame
+        )
         block_masks.append(block_nodata_mask)
         logger.info(
             "Cropped frame nodata mask to block %d window -> %s",
@@ -784,7 +791,9 @@ def run_phase_linking_block(
             staged_files[0],
         )
         block_layover_shadow = block_work_dir / "layover_shadow_mask.tif"
-        _crop_frame_mask_to_block(layover_shadow_mask, template, block, block_layover_shadow, frame)
+        _crop_frame_mask_to_block(
+            layover_shadow_mask, template, block, block_layover_shadow, frame
+        )
         block_masks.append(block_layover_shadow)
         logger.info(
             "Cropped layover/shadow mask to block %d window -> %s",
@@ -806,7 +815,9 @@ def run_phase_linking_block(
     )
     try:
         # Run wrapped phase estimation only (no unwrapping/timeseries/stitching)
-        wrapped_output = wrapped_phase.run(cfg=block_cfg, debug=debug)
+        wrapped_output = wrapped_phase.run(
+            cfg=block_cfg, debug=debug, raise_on_empty=False
+        )
 
         # NISAR inputs have no burst id, so use "phase_linking" as the key
         burst_key = "phase_linking"

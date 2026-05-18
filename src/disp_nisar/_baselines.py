@@ -63,6 +63,7 @@ def _load_orbit_from_cache(cache_dir: Path, cslc_filename: Filename) -> tuple:
     -------
     tuple[isce3.core.Orbit, isce3.core.LookSide]
         Reconstructed orbit object and look side
+
     """
     from disp_nisar._orbit_cache import load_orbit_data
 
@@ -70,7 +71,7 @@ def _load_orbit_from_cache(cache_dir: Path, cslc_filename: Filename) -> tuple:
     if orbit_data is None:
         raise FileNotFoundError(
             f"Could not load cached orbit data for {cslc_filename}. "
-            f"Ensure orbit cache was generated at workflow start."
+            "Ensure orbit cache was generated at workflow start."
         )
 
     # Reconstruct isce3.core.Orbit from cached data
@@ -163,6 +164,7 @@ def compute_baselines(
     else:
         logger.info("Loading orbit data from GSLC files")
         from opera_utils import get_cslc_orbit
+
         side = _get_look_side(h5file_ref)
         orbit_ref = get_cslc_orbit(h5file_ref)
         orbit_sec = get_cslc_orbit(h5file_sec)
@@ -205,7 +207,7 @@ def compute_baselines(
             )
             baselines.append(b)
 
-        except RuntimeError as e:
+        except RuntimeError:
             # geo2rdr failed to converge for this point (likely outside valid coverage)
             # Use NaN for this location and continue
             baselines.append(np.nan)
@@ -213,8 +215,9 @@ def compute_baselines(
 
     if failed_count > 0:
         logger.warning(
-            f"Baseline computation: {failed_count}/{len(lon_arr)} points failed to "
-            f"converge (likely outside valid swath coverage). Using NaN for these points."
+            f"Baseline computation: {failed_count}/{len(lon_arr)} points failed to"
+            " converge (likely outside valid swath coverage). Using NaN for these"
+            " points."
         )
 
     return np.array(baselines).reshape(lon_grid.shape)

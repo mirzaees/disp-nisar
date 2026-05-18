@@ -262,7 +262,8 @@ def create_output_product(
             # Only subtract where ionosphere is not NaN
             disp_arr = np.where(np.isnan(iono_arr), disp_arr, disp_arr - iono_arr)
             logger.info(
-                f"Applied ionosphere correction: {np.count_nonzero(~np.isnan(iono_arr))} valid pixels"
+                "Applied ionosphere correction:"
+                f" {np.count_nonzero(~np.isnan(iono_arr))} valid pixels"
             )
         del iono_arr
         gc.collect()
@@ -472,31 +473,11 @@ def create_output_product(
 
     # Compute baseline now (after displacement/mask arrays are freed) to avoid
     # holding a full-size float32 in memory during the filtering step above.
-    # IMPORTANT: Use the geotransform from the ORIGINAL NISAR GSLC grid, not the
-    # stitched output. With azimuth blocks, the stitched output may have different
-    # bounds than the original GSLCs, causing geo2rdr to fail.
-    import json
-    gslc_grid_file = dolphin_config.work_directory / "gslc_grid_metadata.json"
-    if gslc_grid_file.exists():
-        logger.info(f"Loading GSLC grid metadata from {gslc_grid_file}")
-        with open(gslc_grid_file) as f:
-            gslc_grid = json.load(f)
-        # Use GSLC geotransform for baseline computation
-        y_baseline, x_baseline = _create_yx_arrays(
-            gt=tuple(gslc_grid["geotransform"]),
-            shape=(gslc_grid["rows"], gslc_grid["cols"])
-        )
-    else:
-        logger.warning(
-            f"GSLC grid metadata file not found at {gslc_grid_file}. "
-            "Using output grid for baseline computation (may fail with azimuth blocks)."
-        )
-        # Fallback to output grid (old behavior, may fail with blocks)
-        y_baseline, x_baseline = _create_yx_arrays(gt=gt, shape=shape)
 
     # TODO: do we need all corrections/smaller grids to be same subsample factor?
+    y_baseline, x_baseline = _create_yx_arrays(gt=gt, shape=shape)
     subsample = 50
-    y_baseline, x_baseline = y_baseline[::subsample], x_baseline[::subsample]
+    # y_baseline, x_baseline = y_baseline[::subsample], x_baseline[::subsample]
 
     try:
         logger.info("Calculating perpendicular baselines subsampled by %s", subsample)
@@ -1607,6 +1588,7 @@ def _get_zero_doppler_time_cached(
     -------
     datetime.datetime
         Zero doppler time
+
     """
     # Try cache first if available
     if cache_dir is not None and cache_dir.exists():
@@ -1614,15 +1596,16 @@ def _get_zero_doppler_time_cached(
 
         # Determine if this is start or end time
         start_or_end = "start" if "Start" in dataset else "end"
-        zd_time = get_zero_doppler_time_from_cache(cache_dir, cslc_filename, start_or_end)
+        zd_time = get_zero_doppler_time_from_cache(
+            cache_dir, cslc_filename, start_or_end
+        )
         if zd_time is not None:
             logger.debug(
-                f"Loaded zero doppler {start_or_end} time from cache for {cslc_filename}"
+                f"Loaded zero doppler {start_or_end} time from cache for"
+                f" {cslc_filename}"
             )
             return zd_time
-        logger.debug(
-            f"Zero doppler time not in cache, accessing file {cslc_filename}"
-        )
+        logger.debug(f"Zero doppler time not in cache, accessing file {cslc_filename}")
 
     # Fallback to reading from file
     return get_zero_doppler_time(
@@ -1647,6 +1630,7 @@ def _get_orbit_direction(
     -------
     str
         "ascending" or "descending"
+
     """
     # Try cache first if available
     if cache_dir is not None and cache_dir.exists():
@@ -1690,6 +1674,7 @@ def _get_orbit_type(
     -------
     str
         Full orbit type name
+
     """
     # Try cache first if available
     if cache_dir is not None and cache_dir.exists():
@@ -2146,7 +2131,8 @@ def copy_cslc_metadata_to_compressed(
                 logger.warning(f"Failed to copy orbit group: {e}")
 
             logger.debug(
-                f"Copied metadata from cache to {output_hdf5_file} for {opera_cslc_file}"
+                f"Copied metadata from cache to {output_hdf5_file} for"
+                f" {opera_cslc_file}"
             )
             return
         except Exception as e:
@@ -2184,6 +2170,7 @@ def copy_cslc_metadata_to_displacement(
     cache_dir : Path | None
         Directory containing cached metadata. If provided and exists,
         will load from cache instead of accessing CSLC files.
+
     """
     # Note: orbit group cannot be easily cached due to complex HDF5 structure,
     # so we skip it here. If needed, could be added to cache in the future.
@@ -2221,9 +2208,7 @@ def copy_cslc_metadata_to_displacement(
                 output_file=output_disp_file,
                 dsets_to_copy=common_dsets,
             )
-            logger.debug(
-                f"Copied common metadata from cache to {output_disp_file}"
-            )
+            logger.debug(f"Copied common metadata from cache to {output_disp_file}")
             return
         except Exception as e:
             logger.warning(

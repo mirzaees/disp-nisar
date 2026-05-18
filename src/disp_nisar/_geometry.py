@@ -30,6 +30,7 @@ def _interp_chunk(args):
     -------
     tuple
         (row_slice, (incidence_chunk, los_east_chunk, los_north_chunk))
+
     """
     (
         row_slice,
@@ -138,6 +139,7 @@ def prepare_geometry_layers(
         - 'los_east': Path to LOS east file (DEM native resolution)
         - 'los_north': Path to LOS north file (DEM native resolution)
         - 'layover_shadow_mask': Path to layover/shadow mask file (full frame resolution)
+
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -184,9 +186,7 @@ def prepare_geometry_layers(
 
     # Check coordinate overlap
     t_wgs84 = Transformer.from_crs(f"EPSG:{src_epsg}", "EPSG:4326", always_xy=True)
-    lons, lats = t_wgs84.transform(
-        [x_rg.min(), x_rg.max()], [y_rg.min(), y_rg.max()]
-    )
+    lons, lats = t_wgs84.transform([x_rg.min(), x_rg.max()], [y_rg.min(), y_rg.max()])
     logger.info(
         f"Radar grid WGS84: lon {min(lons):.2f}–{max(lons):.2f}, "
         f"lat {min(lats):.2f}–{max(lats):.2f}"
@@ -198,7 +198,7 @@ def prepare_geometry_layers(
     target_crs = template_da.rio.crs
     target_bounds = template_da.rio.bounds()
     frame_shape = template_da.shape  # Save for layover/shadow mask later
-    frame_transform = template_da.rio.transform()
+    template_da.rio.transform()
     logger.info(
         f"Target frame: {frame_shape[0]} x {frame_shape[1]} pixels, "
         f"CRS: {target_crs}, bounds: {target_bounds}"
@@ -214,15 +214,20 @@ def prepare_geometry_layers(
         from osgeo import gdal
 
         logger.info(
-            f"Warping DEM to target CRS/bounds at native resolution "
-            f"(no resampling for memory efficiency)"
+            "Warping DEM to target CRS/bounds at native resolution "
+            "(no resampling for memory efficiency)"
         )
 
         # Use GDAL warp WITHOUT xRes/yRes - keeps native DEM resolution
         warp_options = gdal.WarpOptions(
             format="GTiff",
             dstSRS=str(target_crs),
-            outputBounds=(target_bounds[0], target_bounds[1], target_bounds[2], target_bounds[3]),
+            outputBounds=(
+                target_bounds[0],
+                target_bounds[1],
+                target_bounds[2],
+                target_bounds[3],
+            ),
             # NO xRes/yRes = keep native resolution!
             resampleAlg="bilinear",
             creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"],
@@ -257,7 +262,9 @@ def prepare_geometry_layers(
     # Prepare chunks for parallel processing
     dem_crs_str = str(dem_crs)
     n_rows = dem_da.shape[0]
-    slices = [slice(i, min(i + chunk_size, n_rows)) for i in range(0, n_rows, chunk_size)]
+    slices = [
+        slice(i, min(i + chunk_size, n_rows)) for i in range(0, n_rows, chunk_size)
+    ]
     tasks = [
         (
             sl,
@@ -293,12 +300,15 @@ def prepare_geometry_layers(
             los_north_surf[sl] = results[2]
 
     # Compute LOS up component (to complete unit vector)
-    los_up_surf = np.sqrt(
-        np.clip(1.0 - los_east_surf**2 - los_north_surf**2, 0, None)
-    ).astype("float32")
+    np.sqrt(np.clip(1.0 - los_east_surf**2 - los_north_surf**2, 0, None)).astype(
+        "float32"
+    )
 
     # Save geometry layers at DEM native resolution using fast GDAL writes
-    logger.info(f"Saving geometry layers at DEM native resolution: {dem_shape[0]}x{dem_shape[1]}")
+    logger.info(
+        "Saving geometry layers at DEM native resolution:"
+        f" {dem_shape[0]}x{dem_shape[1]}"
+    )
 
     from osgeo import gdal, osr
 
@@ -338,21 +348,24 @@ def prepare_geometry_layers(
     logger.info(f"Saving incidence angle to {incidence_path}")
     _write_geotiff_fast(inc_surface, incidence_path, gdal.GDT_Float32, nodata=np.nan)
     logger.info(
-        f"  Incidence angle range: {np.nanmin(inc_surface):.2f}–{np.nanmax(inc_surface):.2f} deg"
+        "  Incidence angle range:"
+        f" {np.nanmin(inc_surface):.2f}–{np.nanmax(inc_surface):.2f} deg"
     )
 
     # Save LOS east component
     logger.info(f"Saving LOS east to {los_east_path}")
     _write_geotiff_fast(los_east_surf, los_east_path, gdal.GDT_Float32, nodata=np.nan)
     logger.info(
-        f"  LOS east range: {np.nanmin(los_east_surf):.3f}–{np.nanmax(los_east_surf):.3f}"
+        "  LOS east range:"
+        f" {np.nanmin(los_east_surf):.3f}–{np.nanmax(los_east_surf):.3f}"
     )
 
     # Save LOS north component
     logger.info(f"Saving LOS north to {los_north_path}")
     _write_geotiff_fast(los_north_surf, los_north_path, gdal.GDT_Float32, nodata=np.nan)
     logger.info(
-        f"  LOS north range: {np.nanmin(los_north_surf):.3f}–{np.nanmax(los_north_surf):.3f}"
+        "  LOS north range:"
+        f" {np.nanmin(los_north_surf):.3f}–{np.nanmax(los_north_surf):.3f}"
     )
 
     # Compute layover/shadow mask at DEM native resolution
@@ -365,7 +378,7 @@ def prepare_geometry_layers(
 
     # Resample layover/shadow mask to FULL FRAME RESOLUTION (to match other masks)
     logger.info(
-        f"Resampling layover/shadow mask to full frame resolution: "
+        "Resampling layover/shadow mask to full frame resolution: "
         f"{frame_shape[0]}x{frame_shape[1]}"
     )
     layover_shadow_native_path = output_dir / "layover_shadow_native.tif"
@@ -382,7 +395,12 @@ def prepare_geometry_layers(
     warp_options = gdal.WarpOptions(
         format="GTiff",
         dstSRS=str(dem_crs),
-        outputBounds=(target_bounds[0], target_bounds[1], target_bounds[2], target_bounds[3]),
+        outputBounds=(
+            target_bounds[0],
+            target_bounds[1],
+            target_bounds[2],
+            target_bounds[3],
+        ),
         width=frame_shape[1],
         height=frame_shape[0],
         resampleAlg="near",  # Nearest neighbor for binary mask
@@ -395,16 +413,18 @@ def prepare_geometry_layers(
         str(layover_shadow_native_path),
         options=warp_options,
     )
-    logger.info(f"Saved layover/shadow mask at full frame resolution to {layover_shadow_path}")
+    logger.info(
+        f"Saved layover/shadow mask at full frame resolution to {layover_shadow_path}"
+    )
 
     # Clean up temporary file
     layover_shadow_native_path.unlink(missing_ok=True)
 
     logger.info(
-        "Geometry preparation complete:\n"
-        f"  - Incidence/LOS: DEM native resolution ({dem_shape[0]}x{dem_shape[1]})\n"
-        f"  - Layover/shadow mask: Full frame resolution ({frame_shape[0]}x{frame_shape[1]})\n"
-        "  - Incidence/LOS will be downsampled to product resolution later"
+        "Geometry preparation complete:\n  - Incidence/LOS: DEM native resolution"
+        f" ({dem_shape[0]}x{dem_shape[1]})\n  - Layover/shadow mask: Full frame"
+        f" resolution ({frame_shape[0]}x{frame_shape[1]})\n  - Incidence/LOS will be"
+        " downsampled to product resolution later"
     )
 
     return {
@@ -447,6 +467,7 @@ def downsample_geometry_for_products(
         - 'incidence_angle': Path to downsampled incidence angle (product resolution)
         - 'los_east': Path to downsampled LOS east (product resolution)
         - 'los_north': Path to downsampled LOS north (product resolution)
+
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -537,6 +558,7 @@ def _compute_layover_shadow_mask(
     -------
     np.ndarray
         Binary mask: 1=good pixel, 0=bad (layover or shadow)
+
     """
     # Shadow: very steep incidence angles (near-horizontal look)
     is_shadow = incidence_angle > shadow_threshold_deg

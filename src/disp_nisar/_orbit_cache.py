@@ -52,6 +52,7 @@ def _convert_to_json_serializable(data):
     -------
     any
         JSON-serializable version of the input data
+
     """
     if data is None:
         return None
@@ -94,7 +95,9 @@ def _convert_to_json_serializable(data):
 
     # Handle dictionaries recursively
     if isinstance(data, dict):
-        return {key: _convert_to_json_serializable(value) for key, value in data.items()}
+        return {
+            key: _convert_to_json_serializable(value) for key, value in data.items()
+        }
 
     # For Python native types (int, float, str, bool), return as-is
     return data
@@ -107,6 +110,7 @@ def _get_look_side_from_file(h5file: Filename) -> str:
     -------
     str
         "Left" or "Right"
+
     """
     with h5py.File(h5file, "r") as hf:
         # Try NISAR path first
@@ -132,6 +136,7 @@ def _extract_hdf5_metadata(h5file: Filename) -> dict:
     -------
     dict
         Dictionary mapping dataset paths to their values (as strings or arrays)
+
     """
     metadata = {}
     with h5py.File(h5file, "r") as hf:
@@ -168,6 +173,7 @@ def save_orbit_metadata_for_cslcs(
         HDF5 subdataset path (if applicable)
     output_dir : Path
         Directory to save metadata cache files
+
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -265,6 +271,7 @@ def load_orbit_data(orbit_cache_dir: Path, cslc_filename: Filename):
     dict
         Dictionary with keys: times, positions, velocities, reference_epoch, look_side
         Or None if not found
+
     """
     try:
         # Parse filename to find the matching orbit cache file
@@ -322,6 +329,7 @@ def load_metadata(cache_dir: Path, cslc_filename: Filename) -> dict | None:
         - zero_doppler_end_time: str (ISO format)
         - hdf5_datasets: dict mapping dataset paths to values
         Or None if not found
+
     """
     try:
         # Parse filename to find the matching metadata cache file
@@ -354,7 +362,9 @@ def load_metadata(cache_dir: Path, cslc_filename: Filename) -> dict | None:
         return None
 
 
-def get_orbit_direction_from_cache(cache_dir: Path, cslc_filename: Filename) -> str | None:
+def get_orbit_direction_from_cache(
+    cache_dir: Path, cslc_filename: Filename
+) -> str | None:
     """Get orbit direction from cache.
 
     Parameters
@@ -368,6 +378,7 @@ def get_orbit_direction_from_cache(cache_dir: Path, cslc_filename: Filename) -> 
     -------
     str | None
         "ascending" or "descending", or None if not found in cache
+
     """
     metadata = load_metadata(cache_dir, cslc_filename)
     if metadata is None:
@@ -396,6 +407,7 @@ def get_orbit_type_from_cache(cache_dir: Path, cslc_filename: Filename) -> str |
     -------
     str | None
         Full orbit type name (e.g., "precise orbit Ephemeris"), or None if not found
+
     """
     orbit_types = {
         "POE": "precise orbit Ephemeris",
@@ -438,6 +450,7 @@ def get_zero_doppler_time_from_cache(
     -------
     datetime | None
         Zero doppler time, or None if not found
+
     """
     metadata = load_metadata(cache_dir, cslc_filename)
     if metadata is None:
@@ -474,6 +487,7 @@ def copy_cached_metadata_to_file(
         List of HDF5 dataset paths to copy from cache
     prepend_str : str
         String to prepend to dataset names when copying (e.g., "reference_")
+
     """
     import h5py
 
@@ -533,5 +547,6 @@ def copy_cached_metadata_to_file(
                 logger.warning(f"Failed to copy {dset_path} to {full_path}: {e}")
 
     logger.debug(
-        f"Copied {copied_count}/{len(dsets_to_copy)} datasets from cache to {output_file}"
+        f"Copied {copied_count}/{len(dsets_to_copy)} datasets from cache to"
+        f" {output_file}"
     )

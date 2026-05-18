@@ -23,7 +23,6 @@ from opera_utils import get_dates, group_by_date
 from disp_nisar import __version__, product
 from disp_nisar._azimuth_blocks import (
     _run_phase_linking_blocks,
-    stitch_full_frame,
     build_frame_nodata_mask,
     compute_block_windows,
     load_block_outputs_from_shards,
@@ -31,6 +30,7 @@ from disp_nisar._azimuth_blocks import (
     resolve_overlap,
     run_full_frame_unwrap_and_timeseries,
     run_phase_linking_block,
+    stitch_full_frame,
 )
 from disp_nisar._masking import (
     create_mask_from_distance,  # , create_layover_shadow_masks
@@ -245,30 +245,9 @@ def _run_azimuth_blocked(
         epsg=int(cfg.output_options.bounds_epsg or cfg.output_options.epsg),
     )
 
-    # Save GSLC grid metadata and orbit data for later use (e.g., baseline computation)
-    # This allows baseline computation to work even after original files are no longer
-    # accessible (e.g., in cloud workflows where files are deleted after processing)
-    import json
-    gslc_grid_file = cfg.work_directory / "gslc_grid_metadata.json"
-    with open(gslc_grid_file, "w") as f:
-        json.dump({
-            "bounds": {
-                "left": frame.bounds.left,
-                "bottom": frame.bounds.bottom,
-                "right": frame.bounds.right,
-                "top": frame.bounds.top,
-            },
-            "epsg": frame.epsg,
-            "x_res": frame.x_res,
-            "y_res": frame.y_res,
-            "rows": frame.rows,
-            "cols": frame.cols,
-            "geotransform": list(frame.geotransform),
-        }, f, indent=2)
-    logger.info(f"Saved GSLC grid metadata to {gslc_grid_file}")
-
     # Save orbit data and metadata for all CSLC files for baseline computation
     from disp_nisar._orbit_cache import save_orbit_metadata_for_cslcs
+
     orbit_cache_dir = cfg.work_directory / "orbit_cache"
     save_orbit_metadata_for_cslcs(
         cslc_files=cfg.cslc_file_list,
@@ -680,6 +659,7 @@ def _get_near_far_incidence_angles(
     -------
     tuple[float, float]
         (near_incidence, far_incidence) in degrees
+
     """
     import numpy as np
 
@@ -793,7 +773,9 @@ def process_product(
         try:
             # Check if ionosphere file has valid data
             iono_data = io.load_gdal(files.ionosphere, masked=True)
-            valid_count = np.count_nonzero(~np.isnan(iono_data)) if iono_data.size > 0 else 0
+            valid_count = (
+                np.count_nonzero(~np.isnan(iono_data)) if iono_data.size > 0 else 0
+            )
 
             if valid_count == 0:
                 logger.warning(
@@ -803,7 +785,7 @@ def process_product(
             else:
                 logger.info(
                     f"Ionosphere file has {valid_count}/{iono_data.size} valid pixels "
-                    f"({100*valid_count/iono_data.size:.1f}%)"
+                    f"({100 * valid_count / iono_data.size:.1f}%)"
                 )
                 warped_iono = stitching.warp_to_match(
                     files.ionosphere, files.unwrapped, resample_alg="bilinear"
@@ -811,8 +793,8 @@ def process_product(
                 iono_radians = io.load_gdal(warped_iono, masked=True)
                 valid_warped = np.count_nonzero(~np.isnan(iono_radians))
                 logger.info(
-                    f"Warped ionosphere has {valid_warped}/{iono_radians.size} valid pixels "
-                    f"({100*valid_warped/iono_radians.size:.1f}%)"
+                    f"Warped ionosphere has {valid_warped}/{iono_radians.size} valid"
+                    f" pixels ({100 * valid_warped / iono_radians.size:.1f}%)"
                 )
 
                 if valid_warped > 0:
@@ -822,7 +804,8 @@ def process_product(
                     logger.info("Ionosphere correction added to corrections dict")
                 else:
                     logger.warning(
-                        "Warped ionosphere has no valid pixels. Skipping ionosphere correction."
+                        "Warped ionosphere has no valid pixels. Skipping ionosphere"
+                        " correction."
                     )
         except Exception as e:
             logger.warning(
@@ -833,7 +816,8 @@ def process_product(
         if files.ionosphere is not None:
             logger.warning(f"Ionosphere file {files.ionosphere} does not exist.")
         logger.debug(
-            "No ionospheric correction for %s. Product will not include ionosphere correction.",
+            "No ionospheric correction for %s. Product will not include ionosphere"
+            " correction.",
             files.unwrapped,
         )
 
