@@ -54,7 +54,7 @@ class BlockWindow(NamedTuple):
     matching GDAL's raster coordinate convention.
     """
 
-    index: int
+    block_index: int
     # Rows the block reads from the GSLCs (central + halo)
     read_start: int
     read_stop: int
@@ -143,7 +143,7 @@ def compute_block_windows(
         )
         windows.append(
             BlockWindow(
-                index=k,
+                block_index=k,
                 read_start=read_start,
                 read_stop=read_stop,
                 write_start=write_start,
@@ -387,14 +387,16 @@ def _narrow_cfg_for_block(
 ) -> DisplacementWorkflow:
     """Return a deep copy of ``cfg`` set up to run PL for a single block.
 
-    The copy narrows `output_options.bounds` to the block's read window, disables
-    unwrap and timeseries inversion (those run once on the assembled frame), and
-    redirects PS, phase_linking, and interferogram_network outputs to ``block_work_dir``.
+    The copy narrows `output_options.bounds` to the block's read window,
+    disables unwrap and timeseries inversion (those run once on the assembled
+    frame), and redirects PS, phase_linking, and interferogram_network outputs
+    to ``block_work_dir``.
 
-    PS, phase_linking, and interferogram_network directories are redirected to the
-    block directory. Each block writes its own interferograms which are later assembled
-    to the main directory. unwrap_options and timeseries_options remain pointing to
-    the main work directory since those stages run on the assembled full frame.
+    PS, phase_linking, and interferogram_network directories are redirected to
+    the block directory. Each block writes its own interferograms which are
+    later assembled to the main directory. unwrap_options and timeseries_options
+    remain pointing to the main work directory since those stages run on the
+    assembled full frame.
     """
     block_cfg = copy.deepcopy(cfg)
     block_cfg.output_options.bounds = tuple(block_bounds(frame, block))
@@ -406,8 +408,9 @@ def _narrow_cfg_for_block(
     old_work_dir = block_cfg.work_directory
     block_cfg.work_directory = block_work_dir
 
-    # Redirect ps_options, phase_linking, and interferogram_network to block directory
-    # Each block writes its own interferograms which are later assembled to main directory
+    # Redirect ps_options, phase_linking, and interferogram_network to block
+    # directory. Each block writes its own interferograms which are later
+    # assembled to the main directory.
     for step in ["ps_options", "phase_linking", "interferogram_network"]:
         opts = getattr(block_cfg, step)
         # Get the relative path from the old work directory
@@ -605,7 +608,7 @@ def _stage_input_to_local(
     src_name = Path(src_str.split("://")[-1]).name  # strip /vsis3/ etc.
     stem = Path(src_name).stem
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{stem}_block{block.index:02d}.tif"
+    out_path = out_dir / f"{stem}_block{block.block_index:02d}.tif"
     if out_path.exists():
         return out_path
 
@@ -626,7 +629,7 @@ def _stage_input_to_local(
         y_size = y_stop - y_off
         if y_size <= 0:
             raise ValueError(
-                f"Empty window for block {block.index} against {src_str}: "
+                f"Empty window for block {block.block_index} against {src_str}: "
                 f"rows={rows}, read=[{block.read_start}, {block.read_stop})"
             )
         gdal.Translate(
@@ -708,19 +711,15 @@ def _stage_inputs_for_block(
     staging_dir.mkdir(parents=True, exist_ok=True)
     subdataset = cfg.input_options.subdataset
     staged: list[Path] = []
-    any_staged = False
+    # Always stage files (even local ones) to ensure consistent dimensions
+    # across all inputs and masks. This prevents dimension mismatches when
+    # dolphin creates a bounds mask using a staged file as a template.
     for src in cfg.cslc_file_list:
-        # staged.append(
-        #     _stage_input_to_local(str(src), subdataset, block, staging_dir, frame)
-        # )
-        if _is_remote_path(src):
-            any_staged = True
-            staged.append(
-                _stage_input_to_local(str(src), subdataset, block, staging_dir, frame)
-            )
-        else:
-            staged.append(Path(src))
-    new_subdataset = None if any_staged else subdataset
+        staged.append(
+            _stage_input_to_local(str(src), subdataset, block, staging_dir, frame)
+        )
+    # All files are staged as GTiffs, so no subdataset
+    new_subdataset = None
     return staged, new_subdataset
 
 
@@ -748,7 +747,7 @@ def run_phase_linking_block(
     polygon-based nodata mask across the block split, since staged GTiffs
     otherwise carry no bounding-polygon metadata.
     """
-    block_work_dir = shard_dir / f"block_{block.index:02d}"
+    block_work_dir = shard_dir / f"block_{block.block_index:02d}"
     block_work_dir.mkdir(parents=True, exist_ok=True)
     block_cfg = _narrow_cfg_for_block(cfg, frame, block, block_work_dir)
 
@@ -762,7 +761,7 @@ def run_phase_linking_block(
             sum(1 for a, b in zip(cfg.cslc_file_list, staged_files) if a != b),
             len(cfg.cslc_file_list),
             staging_dir,
-            block.index,
+            block.block_index,
         )
     block_cfg.cslc_file_list = staged_files
     block_cfg.input_options.subdataset = new_subdataset
@@ -781,7 +780,7 @@ def run_phase_linking_block(
         block_masks.append(block_nodata_mask)
         logger.info(
             "Cropped frame nodata mask to block %d window -> %s",
-            block.index,
+            block.block_index,
             block_nodata_mask,
         )
 
@@ -797,7 +796,7 @@ def run_phase_linking_block(
         block_masks.append(block_layover_shadow)
         logger.info(
             "Cropped layover/shadow mask to block %d window -> %s",
-            block.index,
+            block.block_index,
             block_layover_shadow,
         )
 
@@ -807,7 +806,7 @@ def run_phase_linking_block(
 
     logger.info(
         "Running phase linking for block %d (rows %d..%d write, %d..%d read)",
-        block.index,
+        block.block_index,
         block.write_start,
         block.write_stop,
         block.read_start,

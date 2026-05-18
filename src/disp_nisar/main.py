@@ -256,7 +256,7 @@ def _run_azimuth_blocked(
     )
     logger.info(f"Saved orbit metadata to {orbit_cache_dir}")
 
-    # Geometry layers will be created after the nodata mask (which defines the frame grid)
+    # Geometry layers created after nodata mask (defines frame grid)
     geometry_dir = cfg.work_directory / "geometry"
     layover_shadow_mask = None
 

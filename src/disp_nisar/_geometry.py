@@ -1,4 +1,4 @@
-"""Module for computing geometry products: incidence angles, LOS vectors, and layover/shadow masks."""
+"""Geometry products: incidence angles, LOS vectors, layover/shadow masks."""
 
 from __future__ import annotations
 
@@ -96,9 +96,9 @@ def prepare_geometry_layers(
 
     Memory-efficient approach:
     - Reprojects DEM to target CRS at **native resolution** (no resampling, faster)
-    - Interpolates geometry at **DEM native resolution** (smaller arrays, less memory)
-    - Saves layover/shadow mask at **full frame resolution** (to match other masks)
-    - Saves inc/LOS at **DEM native resolution** (downsampled later to product resolution)
+    - Interpolates geometry at **DEM native resolution** (smaller arrays)
+    - Saves layover/shadow mask at **full frame resolution** (to match masks)
+    - Saves inc/LOS at **DEM native resolution** (downsampled to product res)
 
     This avoids creating large full-frame geometry arrays when unnecessary.
 
@@ -138,7 +138,7 @@ def prepare_geometry_layers(
         - 'incidence_angle': Path to incidence angle file (DEM native resolution)
         - 'los_east': Path to LOS east file (DEM native resolution)
         - 'los_north': Path to LOS north file (DEM native resolution)
-        - 'layover_shadow_mask': Path to layover/shadow mask file (full frame resolution)
+        - 'layover_shadow_mask': Path to layover/shadow mask (full frame res)
 
     """
     output_dir = Path(output_dir)
@@ -456,7 +456,7 @@ def downsample_geometry_for_products(
     los_north_path : Path
         Path to LOS north raster at DEM native resolution
     reference_raster : Filename
-        Reference raster defining the target product grid (e.g., unwrapped phase product)
+        Reference raster defining target product grid (e.g., unwrapped phase)
     output_dir : Path
         Directory to save downsampled geometry layers
 

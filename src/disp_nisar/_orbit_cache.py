@@ -1,4 +1,4 @@
-"""Module for caching GSLC metadata to support product creation without GSLC file access.
+"""Module for caching GSLC metadata to support product creation.
 
 This module caches:
 - Orbit data (times, positions, velocities)
@@ -153,10 +153,10 @@ def _extract_hdf5_metadata(h5file: Filename) -> dict:
 
 def save_orbit_metadata_for_cslcs(
     cslc_files: list[Filename],
-    subdataset: str | None,
+    subdataset: str | None,  # noqa: ARG001
     output_dir: Path,
 ) -> None:
-    """Save orbit and metadata for all CSLC files for product creation without file access.
+    """Save orbit and metadata for all CSLC files for product creation.
 
     Saves:
     - Orbit data (times, positions, velocities)

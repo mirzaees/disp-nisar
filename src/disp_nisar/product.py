@@ -258,7 +258,7 @@ def create_output_product(
                 ref_iono = iono_arr[reference_point.row, reference_point.col]
                 if not np.isnan(ref_iono):
                     iono_arr -= ref_iono
-            # Subtract ionosphere using nansum-like behavior to preserve valid displacement values
+            # Subtract ionosphere preserving valid displacement values
             # Only subtract where ionosphere is not NaN
             disp_arr = np.where(np.isnan(iono_arr), disp_arr, disp_arr - iono_arr)
             logger.info(
@@ -1639,7 +1639,7 @@ def _get_orbit_direction(
         orbit_dir = get_orbit_direction_from_cache(cache_dir, cslc_filename)
         if orbit_dir is not None:
             logger.debug(f"Loaded orbit direction from cache for {cslc_filename}")
-            return orbit_dir
+            return cast(Literal["ascending", "descending"], orbit_dir)
         logger.debug(f"Orbit direction not in cache, accessing file {cslc_filename}")
 
     # Fallback to reading from file

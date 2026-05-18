@@ -348,12 +348,14 @@ def read_ionosphere_phase_screen(
     # Extract geotransform and projection from GUNW HDF5 file
     with h5py.File(valid_gunw_files[0], "r") as f:
         # Get coordinate arrays
-        coord_base = f"/science/LSAR/GUNW/grids/{frequency}/unwrappedInterferogram/{polarization}"
+        base = f"/science/LSAR/GUNW/grids/{frequency}/unwrappedInterferogram"
+        coord_base = f"{base}/{polarization}"
         x_coords = f[f"{coord_base}/xCoordinates"][:]
         y_coords = f[f"{coord_base}/yCoordinates"][:]
 
         # Read projection - could be EPSG code or WKT string
         projection_data = f[f"{coord_base}/projection"][()]
+        gunw_projection: int | str
         if isinstance(projection_data, (int, np.integer)):
             # It's an EPSG code
             gunw_projection = int(projection_data)
