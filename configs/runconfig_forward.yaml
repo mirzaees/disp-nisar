@@ -75,9 +75,11 @@ worker_settings:
   #   each python process.
   #   Type: integer.
   threads_per_worker: 2
-  # Number of parallel workers for PS detection and phase linking within each azimuth block.
-  # Increases CPU utilization to speed up processing. Processes tiles/pixels in parallel.
+  # Number of parallel workers for PS detection and phase linking WITHIN each azimuth block.
+  # NISAR has no bursts - this controls tile/pixel parallelism within blocks, NOT between blocks.
+  # Increases CPU utilization by processing tiles/pixels in parallel within a block.
   # Recommended: 50-75% of available CPU cores for optimal performance.
+  # Example: For 32-core machine, use 16-24 workers.
   #   Type: integer.
   num_parallel_workers: 1
   # Size (rows, columns) of blocks of data to load at a time.

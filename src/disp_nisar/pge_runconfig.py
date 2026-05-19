@@ -72,10 +72,21 @@ class WorkerSettings(DolphinWorkerSettings):
     Extends dolphin's WorkerSettings to accept NISAR-friendly parameter names
     while maintaining compatibility with dolphin's internal n_parallel_bursts.
 
-    For azimuth-blocked processing:
+    IMPORTANT: NISAR has NO bursts (unlike Sentinel-1).
+
+    For NISAR azimuth-blocked processing:
+    - Blocks are processed sequentially (one at a time)
     - num_parallel_workers controls parallelism WITHIN each block
     - Processes tiles/pixels in parallel during PS detection and phase linking
-    - Recommended: 50-75% of available CPU cores for optimal performance
+    - Does NOT control block-level parallelism (blocks = sequential)
+
+    Architecture:
+        Frame → Block 0 → num_parallel_workers process tiles in parallel
+             → Block 1 → num_parallel_workers process tiles in parallel
+             → Block 2 → num_parallel_workers process tiles in parallel
+             ...
+
+    Recommended: 50-75% of available CPU cores for optimal performance.
     """
 
     num_parallel_workers: Optional[int] = Field(

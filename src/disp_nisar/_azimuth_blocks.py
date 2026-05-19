@@ -734,6 +734,13 @@ def run_phase_linking_block(
 ) -> OutputPaths:
     """Run dolphin's displacement workflow for a single azimuth block (PL only).
 
+    IMPORTANT FOR NISAR PROCESSING:
+    - NISAR has NO bursts (unlike Sentinel-1)
+    - Each azimuth block is processed as a single unit
+    - cfg.worker_settings.n_parallel_bursts controls parallelism WITHIN the block
+      (for processing tiles/pixels in parallel), NOT between blocks
+    - Block-level parallelism is controlled by _run_phase_linking_blocks()
+
     When inputs are remote (``/vsis3/``, ``s3://``, etc.), each GSLC and
     compressed-SLC file has the block's azimuth window materialized into a
     local GeoTIFF before dolphin starts. The staged files are deleted after
@@ -814,8 +821,17 @@ def run_phase_linking_block(
     )
     try:
         # Run wrapped phase estimation only (no unwrapping/timeseries/stitching)
+        # IMPORTANT: For NISAR, we call wrapped_phase.run() directly (NOT
+        # displacement.run()). This processes a single "unit" (our azimuth block)
+        # with NO burst-level parallelism. The max_workers parameter controls
+        # parallelism WITHIN the block for processing tiles/pixels.
+        # n_parallel_bursts is misleadingly named for NISAR - it actually means
+        # "workers within block" not "parallel bursts".
         wrapped_output = wrapped_phase.run(
-            cfg=block_cfg, debug=debug, raise_on_empty=False
+            cfg=block_cfg,
+            debug=debug,
+            raise_on_empty=False,
+            max_workers=cfg.worker_settings.n_parallel_bursts,
         )
 
         # NISAR inputs have no burst id, so use "phase_linking" as the key
