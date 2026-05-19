@@ -75,10 +75,11 @@ worker_settings:
   #   each python process.
   #   Type: integer.
   threads_per_worker: 2
-  # If processing separate spatial bursts, number of bursts to run in parallel for wrapped-
-  #   phase-estimation.
+  # Number of parallel workers for PS detection and phase linking within each azimuth block.
+  # Increases CPU utilization to speed up processing. Processes tiles/pixels in parallel.
+  # Recommended: 50-75% of available CPU cores for optimal performance.
   #   Type: integer.
-  n_parallel_bursts: 1
+  num_parallel_workers: 1
   # Size (rows, columns) of blocks of data to load at a time.
   #   Type: array.
   block_shape:
