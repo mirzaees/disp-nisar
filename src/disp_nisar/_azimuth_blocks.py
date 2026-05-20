@@ -29,6 +29,7 @@ import gc
 import logging
 import multiprocessing as mp
 import shutil
+import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -853,6 +854,7 @@ def _stage_inputs_for_block(
         Staged file paths and new subdataset value
 
     """
+    t0 = time.perf_counter()
     staging_dir.mkdir(parents=True, exist_ok=True)
     subdataset = cfg.input_options.subdataset
     staged: list[Path] = []
@@ -865,6 +867,13 @@ def _stage_inputs_for_block(
         )
     # All files are staged as GTiffs, so no subdataset
     new_subdataset = None
+    logger.info(
+        "staging block completed",
+        extra={
+            "block": block,
+            "elapsed": time.perf_counter() - t0,
+        },
+    )
     return staged, new_subdataset
 
 
@@ -1003,8 +1012,7 @@ def run_phase_linking_block(
             reference_point=None,
         )
     finally:
-        print(staging_dir)
-        # shutil.rmtree(staging_dir, ignore_errors=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _stem_looks_like_nisar(p: object) -> bool:

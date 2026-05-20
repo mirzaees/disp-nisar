@@ -1,13 +1,12 @@
 """Unit tests for azimuth blocking functionality."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 from dolphin._types import Bbox
 from dolphin.io import write_arr
-from dolphin.workflows.config import DisplacementWorkflow
 
 from disp_nisar._azimuth_blocks import (
     BlockWindow,
@@ -101,9 +100,7 @@ class TestComputeBlockWindows:
     def test_blocks_are_contiguous(self):
         """Test that write windows are contiguous and cover entire frame."""
         total_rows = 1000
-        windows = compute_block_windows(
-            total_rows=total_rows, num_blocks=7, overlap=15
-        )
+        windows = compute_block_windows(total_rows=total_rows, num_blocks=7, overlap=15)
 
         # Check first block starts at 0
         assert windows[0].write_start == 0
