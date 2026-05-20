@@ -24,6 +24,7 @@ Three execution modes are driven by `azimuth_blocks.block_index`:
 from __future__ import annotations
 
 import copy
+import functools
 import gc
 import logging
 import multiprocessing as mp
@@ -289,36 +290,37 @@ def load_grid_from_nisar_gslc(
 ) -> FullFrameGrid:
     """Return the authoritative native grid of a NISAR GSLC.
 
-    This is the grid that dolphin's ``make_nodata_mask`` and our own staged
-    GTiffs inherit. Block windows, nodata crops, and per-block bounds all
-    derive from this so ``combine_mask_files`` sees consistent raster sizes
-    across its inputs.
-
-    The EPSG is taken from the caller (typically ``cfg.output_options.bounds_epsg``)
-    rather than re-derived from the GSLC's projection WKT — NISAR GSLC WKTs
-    often lack an ``AUTHORITY`` tag and can defeat ``AutoIdentifyEPSG``.
+    Reads x/yCoordinates and x/yCoordinateSpacing via GDAL's multidim API so
+    it works for both local paths and ``/vsis3/...`` URLs. The classic HDF5
+    driver does not expose a geotransform for NISAR GSLCs.
     """
     from osgeo import gdal
 
     src_str = str(gslc_path)
 
-    # Try to get geotransform from NISAR HDF5 metadata (handles NISAR properly)
-    gt = None
+    # Resolve frequency from the subdataset path (e.g. ".../frequencyA/HH").
     frequency = "frequencyA"
-    if subdataset:
-        # Extract frequency from subdataset path if present
-        if "frequency" in subdataset.lower():
-            for part in subdataset.split("/"):
-                if part.startswith("frequency"):
-                    frequency = part
-                    break
+    if subdataset and "frequency" in subdataset.lower():
+        for part in subdataset.split("/"):
+            if part.startswith("frequency"):
+                frequency = part
+                break
 
-    if src_str.lower().endswith((".h5", ".hdf5")):
-        gt = _get_nisar_geotransform(src_str, frequency=frequency)
-        if gt is not None:
-            logger.debug(f"Got geotransform from NISAR metadata: {gt}")
+    is_hdf5 = src_str.lower().endswith((".h5", ".hdf5"))
 
-    # Fallback to standard GDAL if direct HDF5 read didn't work
+    gt: tuple[float, ...] | None = None
+    rows = cols = None
+
+    # Preferred path for NISAR GSLCs: multidim API. Works over /vsis3.
+    if is_hdf5:
+        info = _read_nisar_grid_multidim(src_str, frequency)
+        if info is not None:
+            gt, rows, cols = info
+            logger.debug(f"Got NISAR grid via multidim API: gt={gt} ({cols}x{rows})")
+
+    # Fallback for non-NISAR / non-HDF5 inputs (geotiffs, properly tagged
+    # netCDFs, etc.). Won't recover NISAR GSLCs — those must go through
+    # the multidim path above.
     if gt is None or tuple(gt) == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
         logger.debug("Falling back to standard GDAL GetGeoTransform")
         if subdataset and src_str.lower().endswith((".h5", ".hdf5", ".nc")):
@@ -334,27 +336,14 @@ def load_grid_from_nisar_gslc(
             cols = ds.RasterXSize
         finally:
             ds = None
-    else:
-        # Got valid geotransform from HDF5 metadata, now get dimensions via GDAL
-        if subdataset and src_str.lower().endswith((".h5", ".hdf5", ".nc")):
-            uri = f'HDF5:"{src_str}"://{subdataset.lstrip("/")}'
-        else:
-            uri = src_str
-        ds = gdal.Open(uri)
-        if ds is None:
-            raise RuntimeError(f"GDAL could not open NISAR GSLC at {uri}")
-        try:
-            rows = ds.RasterYSize
-            cols = ds.RasterXSize
-        finally:
-            ds = None
 
-    # Validate geotransform
     if gt is None or tuple(gt) == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
         raise RuntimeError(
             f"Could not get valid geotransform from {src_str}. "
             "Got identity matrix, which means the file is not properly georeferenced."
         )
+    if rows is None or cols is None:
+        raise RuntimeError(f"Could not determine raster size for {src_str}")
 
     left = gt[0]
     x_res = gt[1]
@@ -377,6 +366,162 @@ def load_grid_from_nisar_gslc(
         rows=rows,
         cols=cols,
     )
+
+
+@functools.lru_cache(maxsize=256)
+def _read_nisar_grid_multidim(
+    path: str, frequency: str
+) -> tuple[tuple[float, float, float, float, float, float], int, int] | None:
+    """Return (geotransform, rows, cols) for a NISAR GSLC.
+
+    Combines pixel-center ``x/yCoordinates`` with the signed
+    ``x/yCoordinateSpacing`` scalars to produce a GDAL-convention
+    (outer-corner) geotransform. Works for local paths and ``/vsis3``.
+    """
+    from osgeo import gdal
+
+    # Accept "A"/"B" or "frequencyA"/"frequencyB".
+    freq_short = frequency.removeprefix("frequency") or "A"
+
+    ds = grp = None
+    try:
+        ds = gdal.OpenEx(path, gdal.OF_MULTIDIM_RASTER)
+        if ds is None:
+            return None
+        grp = ds.GetRootGroup()
+        for name in ("science", "LSAR", "GSLC", "grids", f"frequency{freq_short}"):
+            grp = grp.OpenGroup(name)
+            if grp is None:
+                return None
+
+        f64 = gdal.ExtendedDataType.Create(gdal.GDT_Float64)
+        x = grp.OpenMDArray("xCoordinates").ReadAsArray(buffer_datatype=f64)
+        y = grp.OpenMDArray("yCoordinates").ReadAsArray(buffer_datatype=f64)
+
+        # Authoritative spacings (signed); fall back to diffs if absent.
+        try:
+            dx = float(grp.OpenMDArray("xCoordinateSpacing").ReadAsArray().item())
+        except Exception:
+            dx = float(x[1] - x[0]) if x is not None and x.size > 1 else 0.0
+        try:
+            dy = float(grp.OpenMDArray("yCoordinateSpacing").ReadAsArray().item())
+        except Exception:
+            dy = float(y[1] - y[0]) if y is not None and y.size > 1 else 0.0
+    except Exception as e:
+        logger.debug(f"_read_nisar_grid_multidim failed for {path}: {e}")
+        return None
+    finally:
+        grp = ds = None
+
+    if x is None or y is None or x.size < 1 or y.size < 1 or dx == 0.0 or dy == 0.0:
+        return None
+
+    # xCoordinates/yCoordinates are pixel CENTERS; GDAL's geotransform
+    # origin is the OUTER CORNER of the top-left pixel.
+    gt = (
+        float(x[0]) - dx / 2.0,
+        dx,
+        0.0,
+        float(y[0]) - dy / 2.0,
+        0.0,
+        dy,
+    )
+    return gt, int(y.size), int(x.size)
+
+
+# def load_grid_from_nisar_gslc(
+#     gslc_path: object, subdataset: str | None, epsg: int
+# ) -> FullFrameGrid:
+#     """Return the authoritative native grid of a NISAR GSLC.
+
+#     This is the grid that dolphin's ``make_nodata_mask`` and our own staged
+#     GTiffs inherit. Block windows, nodata crops, and per-block bounds all
+#     derive from this so ``combine_mask_files`` sees consistent raster sizes
+#     across its inputs.
+
+#     The EPSG is taken from the caller (typically ``cfg.output_options.bounds_epsg``)
+#     rather than re-derived from the GSLC's projection WKT — NISAR GSLC WKTs
+#     often lack an ``AUTHORITY`` tag and can defeat ``AutoIdentifyEPSG``.
+#     """
+#     from osgeo import gdal
+
+#     src_str = str(gslc_path)
+
+#     # Try to get geotransform from NISAR HDF5 metadata (handles NISAR properly)
+#     gt = None
+#     frequency = "frequencyA"
+#     if subdataset:
+#         # Extract frequency from subdataset path if present
+#         if "frequency" in subdataset.lower():
+#             for part in subdataset.split("/"):
+#                 if part.startswith("frequency"):
+#                     frequency = part
+#                     break
+
+#     if src_str.lower().endswith((".h5", ".hdf5")):
+#         gt = _get_nisar_geotransform(src_str, frequency=frequency)
+#         if gt is not None:
+#             logger.debug(f"Got geotransform from NISAR metadata: {gt}")
+
+#     # Fallback to standard GDAL if direct HDF5 read didn't work
+#     if gt is None or tuple(gt) == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
+#         logger.debug("Falling back to standard GDAL GetGeoTransform")
+#         if subdataset and src_str.lower().endswith((".h5", ".hdf5", ".nc")):
+#             uri = f'HDF5:"{src_str}"://{subdataset.lstrip("/")}'
+#         else:
+#             uri = src_str
+#         ds = gdal.Open(uri)
+#         if ds is None:
+#             raise RuntimeError(f"GDAL could not open NISAR GSLC at {uri}")
+#         try:
+#             gt = ds.GetGeoTransform()
+#             rows = ds.RasterYSize
+#             cols = ds.RasterXSize
+#         finally:
+#             ds = None
+#     else:
+#         # Got valid geotransform from HDF5 metadata, now get dimensions via GDAL
+#         if subdataset and src_str.lower().endswith((".h5", ".hdf5", ".nc")):
+#             uri = f'HDF5:"{src_str}"://{subdataset.lstrip("/")}'
+#         else:
+#             uri = src_str
+#         ds = gdal.Open(uri)
+#         if ds is None:
+#             raise RuntimeError(f"GDAL could not open NISAR GSLC at {uri}")
+#         try:
+#             rows = ds.RasterYSize
+#             cols = ds.RasterXSize
+#         finally:
+#             ds = None
+
+#     # Validate geotransform
+#     if gt is None or tuple(gt) == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
+#         raise RuntimeError(
+#             f"Could not get valid geotransform from {src_str}. "
+#             "Got identity matrix, which means the file is not properly georeferenced."
+#         )
+
+#     left = gt[0]
+#     x_res = gt[1]
+#     top = gt[3]
+#     y_res = abs(gt[5])
+#     right = left + cols * x_res
+#     bottom = top - rows * y_res
+
+#     logger.info(
+#         f"Loaded NISAR GSLC grid: {cols}x{rows} pixels, "
+#         f"bounds: ({left:.2f}, {bottom:.2f}, {right:.2f}, {top:.2f}), "
+#         f"resolution: {x_res:.2f} x {y_res:.2f}"
+#     )
+
+#     return FullFrameGrid(
+#         bounds=Bbox(left, bottom, right, top),
+#         epsg=int(epsg),
+#         x_res=x_res,
+#         y_res=y_res,
+#         rows=rows,
+#         cols=cols,
+#     )
 
 
 def _narrow_cfg_for_block(
@@ -858,7 +1003,8 @@ def run_phase_linking_block(
             reference_point=None,
         )
     finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        print(staging_dir)
+        # shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _stem_looks_like_nisar(p: object) -> bool:

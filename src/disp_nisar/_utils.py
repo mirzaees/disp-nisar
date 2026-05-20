@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import functools
 import logging
 import shutil
 from collections.abc import Sequence
 from multiprocessing import get_context
+from os import fspath
 from pathlib import Path
 
 import numpy as np
@@ -15,10 +17,18 @@ from dolphin.interferogram import estimate_correlation_from_phase
 from dolphin.unwrap import grow_conncomp_snaphu
 from dolphin.utils import full_suffix
 from dolphin.workflows.config import UnwrapOptions
-from opera_utils._cslc import _get_dset_and_attrs
-from osgeo import gdal
+from opera_utils._cslc import _get_dset_and_attrs, _read_nisar_projection_wkt
 from shapely.geometry import LinearRing, MultiPolygon, Polygon
 from tqdm.contrib.concurrent import thread_map
+
+try:
+    from osgeo import gdal, osr
+
+    HAS_GDAL = True
+except ImportError:
+    HAS_GDAL = False
+    gdal = None
+    osr = None
 
 logger = logging.getLogger(__name__)
 
@@ -294,63 +304,179 @@ def get_nisar_frame_bbox(
     frequency: str = "frequencyA",
     polarization: str = "HH",  # noqa: ARG001
 ) -> tuple[int, Bbox]:
-    """Extract the EPSG code and bounding box from a NISAR CSLC file.
+    """Return ``(epsg, Bbox(left, bottom, right, top))`` for a CSLC file.
 
-    Parameters
-    ----------
-    cslc_file : Path
-        path to the NISAR CSLC file (.h5 or .hdf5)
-    frequency : str
-        Frequency band to use (default: "frequencyA")
-    polarization : str
-        Polarization to use (default: "HH")
-
-    Returns
-    -------
-    tuple[int, Bbox]
-        (EPSG code, Bounding box)
-
-    Raises
-    ------
-    ValueError: If required metadata is missing
-
+    For NISAR GSLC (``.h5`` / ``.hdf5``) this uses GDAL's multidim API, so
+    it works for local paths and ``/vsis3/...`` URLs alike. The
+    ``polarization`` argument is unused (the projected grid is shared
+    across polarizations within a frequency) and is kept for API
+    compatibility.
     """
-    if cslc_file.suffix in {".h5", ".hdf5"}:
-        import h5py
+    path = fspath(cslc_file)
+    ext = Path(path).suffix.lower()
 
-        # Read CRS and bounds directly from NISAR HDF5 metadata
-        with h5py.File(cslc_file, "r") as h5f:
-            grid_group = h5f[f"science/LSAR/GSLC/grids/{frequency}"]
-            epsg = int(grid_group["projection"][()])
+    if ext in {".h5", ".hdf5"}:
+        # Accept either "A"/"B" or "frequencyA"/"frequencyB"
+        freq_short = frequency.removeprefix("frequency") or "A"
+        result = _read_nisar_bbox_multidim_cached(path, freq_short)
+        if result is None:
+            msg = f"Could not read EPSG/bbox from {cslc_file}"
+            raise RuntimeError(msg)
+        epsg, bounds = result
+        return epsg, Bbox(*bounds)
 
-            x_coords = grid_group["xCoordinates"][:]
-            y_coords = grid_group["yCoordinates"][:]
-            x_spacing = float(grid_group["xCoordinateSpacing"][()])
-            y_spacing = float(grid_group["yCoordinateSpacing"][()])
+    # Alternative format (non-NISAR HDF5) — local h5py path, unchanged.
+    import h5py
 
-            # Compute bounds (left, bottom, right, top)
-            bounds = (
-                float(x_coords.min()) - abs(x_spacing) / 2,
-                float(y_coords.min()) - abs(y_spacing) / 2,
-                float(x_coords.max()) + abs(x_spacing) / 2,
-                float(y_coords.max()) + abs(y_spacing) / 2,
-            )
-    else:
-        import h5py
-
-        # Alternative format handling (non-NISAR HDF5)
-        with h5py.File(cslc_file, "r") as src:
-            epsg = src["data"]["spatial_ref"][()]
-            data = src["data"]
-
-            bounds = (
-                data["x"][()].min(),
-                data["y"][()].min(),
-                data["x"][()].max(),
-                data["y"][()].max(),
-            )
+    with h5py.File(path, "r") as src:
+        epsg = int(src["data"]["spatial_ref"][()])
+        data = src["data"]
+        bounds = (
+            float(data["x"][()].min()),
+            float(data["y"][()].min()),
+            float(data["x"][()].max()),
+            float(data["y"][()].max()),
+        )
 
     return epsg, Bbox(*bounds)
+
+    # if cslc_file.suffix in {".h5", ".hdf5"}:
+    #     import h5py
+
+    #     # Read CRS and bounds directly from NISAR HDF5 metadata
+    #     with h5py.File(cslc_file, "r") as h5f:
+    #         grid_group = h5f[f"science/LSAR/GSLC/grids/{frequency}"]
+    #         epsg = int(grid_group["projection"][()])
+
+    #         x_coords = grid_group["xCoordinates"][:]
+    #         y_coords = grid_group["yCoordinates"][:]
+    #         x_spacing = float(grid_group["xCoordinateSpacing"][()])
+    #         y_spacing = float(grid_group["yCoordinateSpacing"][()])
+
+    #         # Compute bounds (left, bottom, right, top)
+    #         bounds = (
+    #             float(x_coords.min()) - abs(x_spacing) / 2,
+    #             float(y_coords.min()) - abs(y_spacing) / 2,
+    #             float(x_coords.max()) + abs(x_spacing) / 2,
+    #             float(y_coords.max()) + abs(y_spacing) / 2,
+    #         )
+    # else:
+    #     import h5py
+
+    #     # Alternative format handling (non-NISAR HDF5)
+    #     with h5py.File(cslc_file, "r") as src:
+    #         epsg = src["data"]["spatial_ref"][()]
+    #         data = src["data"]
+
+    #         bounds = (
+    #             data["x"][()].min(),
+    #             data["y"][()].min(),
+    #             data["x"][()].max(),
+    #             data["y"][()].max(),
+    #         )
+
+    # return epsg, Bbox(*bounds)
+
+
+@functools.lru_cache(maxsize=256)
+def _read_nisar_bbox_multidim_cached(
+    path: str, freq: str
+) -> tuple[int, tuple[float, float, float, float]] | None:
+    ds = grp = None
+    try:
+        ds = gdal.OpenEx(path, gdal.OF_MULTIDIM_RASTER)
+        if ds is None:
+            return None
+        grp = ds.GetRootGroup()
+        for name in ("science", "LSAR", "GSLC", "grids", f"frequency{freq}"):
+            grp = grp.OpenGroup(name)
+            if grp is None:
+                return None
+
+        f64 = gdal.ExtendedDataType.Create(gdal.GDT_Float64)
+        x = grp.OpenMDArray("xCoordinates").ReadAsArray(buffer_datatype=f64)
+        y = grp.OpenMDArray("yCoordinates").ReadAsArray(buffer_datatype=f64)
+
+        # Authoritative spacings (match h5py code); fall back to diffs.
+        x_spacing = _read_scalar_or(grp, "xCoordinateSpacing", x)
+        y_spacing = _read_scalar_or(grp, "yCoordinateSpacing", y)
+
+        epsg = _epsg_from_projection_mdarray(grp.OpenMDArray("projection"))
+    except Exception as e:
+        logger.debug(f"_read_nisar_bbox_multidim_cached failed for {path}: {e}")
+        return None
+    finally:
+        grp = ds = None
+
+    if (
+        x is None
+        or y is None
+        or x.size == 0
+        or y.size == 0
+        or epsg is None
+        or x_spacing is None
+        or y_spacing is None
+    ):
+        return None
+
+    hx = abs(x_spacing) / 2.0
+    hy = abs(y_spacing) / 2.0
+    bounds = (
+        float(x.min()) - hx,
+        float(y.min()) - hy,
+        float(x.max()) + hx,
+        float(y.max()) + hy,
+    )
+    return int(epsg), bounds
+
+
+def _read_scalar_or(grp, name: str, fallback_arr) -> float | None:
+    """Read a scalar MDArray as float; fall back to step of ``fallback_arr``."""
+    try:
+        return float(grp.OpenMDArray(name).ReadAsArray().item())
+    except Exception:
+        try:
+            if fallback_arr is not None and fallback_arr.size > 1:
+                return float(fallback_arr[1] - fallback_arr[0])
+        except Exception:
+            pass
+    return None
+
+
+def _epsg_from_projection_mdarray(proj_ar) -> int | None:
+    """Pull an integer EPSG code from a NISAR ``projection`` MDArray.
+
+    NISAR stores the EPSG as the scalar value of the ``projection``
+    variable (``projection[()]`` in h5py); fall back to an
+    ``epsg_code`` attribute or a WKT-derived authority code.
+    """
+    # Primary: scalar data value — matches `grid_group["projection"][()]`.
+    try:
+        return int(proj_ar.ReadAsArray().item())
+    except Exception:
+        pass
+    # Fallback 1: `epsg_code` attribute.
+    try:
+        attr = proj_ar.GetAttribute("epsg_code")
+        if attr is not None:
+            v = attr.Read()
+            if isinstance(v, (list, tuple)):
+                v = v[0]
+            return int(v)
+    except Exception:
+        pass
+    # Fallback 2: derive from WKT (uses your existing helper).
+    wkt = _read_nisar_projection_wkt(proj_ar)
+    if wkt:
+        srs = osr.SpatialReference()
+        if srs.ImportFromWkt(wkt) == 0:
+            code = srs.GetAuthorityCode(None)
+            if code:
+                try:
+                    return int(code)
+                except ValueError:
+                    return None
+    return None
 
 
 def _frequency_to_wavelength(frequency: str, gslc_file: Filename) -> float:

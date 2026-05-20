@@ -11,12 +11,23 @@ This module caches:
 import json
 import logging
 from datetime import datetime
+from os import fspath
 from pathlib import Path
+from typing import Any
 
-import h5py
 import numpy as np
 from dolphin._types import Filename
 from opera_utils import get_orbit_arrays, get_zero_doppler_time, parse_filename
+from opera_utils._cslc import _read_mdarray_value, _read_string_mdarray
+
+try:
+    from osgeo import gdal
+
+    HAS_GDAL = True
+except ImportError:
+    HAS_GDAL = False
+    gdal = None
+    osr = None
 
 logger = logging.getLogger(__name__)
 
@@ -104,51 +115,83 @@ def _convert_to_json_serializable(data):
 
 
 def _get_look_side_from_file(h5file: Filename) -> str:
-    """Get the look side from a NISAR GSLC HDF5 file.
+    """Get the look side ("Left" / "Right") from a NISAR GSLC HDF5 file.
 
-    Returns
-    -------
-    str
-        "Left" or "Right"
-
+    Uses GDAL's multidim API so it works for ``/vsis3/...`` URLs as well as
+    local paths.
     """
-    with h5py.File(h5file, "r") as hf:
-        # Try NISAR path first
-        for path in [
-            "/science/LSAR/identification/lookDirection",
-            "/identification/lookDirection",
-        ]:
-            if path in hf:
-                look_dir = (
-                    hf[path][()].decode()
-                    if isinstance(hf[path][()], bytes)
-                    else hf[path][()]
-                )
-                return look_dir
-        # Default to right if not found
-        return "Right"
+    for path in (
+        "/science/LSAR/identification/lookDirection",
+        "/identification/lookDirection",
+    ):
+        val = _read_string_mdarray(h5file, path)
+        if val:
+            return val.strip().rstrip("\x00") or "Right"
+    return "Right"
 
 
 def _extract_hdf5_metadata(h5file: Filename) -> dict:
-    """Extract metadata datasets from NISAR GSLC file.
+    """Extract metadata datasets from a NISAR GSLC via GDAL's multidim API.
 
-    Returns
-    -------
-    dict
-        Dictionary mapping dataset paths to their values (as strings or arrays)
-
+    Works for ``/vsis3/...`` URLs and local paths. Opens the file once and
+    walks every path in ``NISAR_METADATA_PATHS`` against the same root
+    group, so per-path cost is just the range reads, not a full reopen.
     """
-    metadata = {}
-    with h5py.File(h5file, "r") as hf:
+    metadata: dict[str, Any] = {}
+    if not HAS_GDAL:
+        msg = "osgeo (GDAL) must be installed to use this function"
+        raise ImportError(msg)
+
+    ds = root = None
+    try:
+        ds = gdal.OpenEx(fspath(h5file), gdal.OF_MULTIDIM_RASTER)
+        if ds is None:
+            logger.debug(f"Could not open {h5file} with GDAL multidim API")
+            return metadata
+        root = ds.GetRootGroup()
+
         for dset_path in NISAR_METADATA_PATHS:
-            if dset_path in hf:
-                try:
-                    data = hf[dset_path][()]
-                    # Use the comprehensive conversion function
-                    metadata[dset_path] = _convert_to_json_serializable(data)
-                except Exception as e:
-                    logger.debug(f"Could not extract {dset_path}: {e}")
+            try:
+                value = _read_path_under_root(root, dset_path)
+            except Exception as e:
+                logger.debug(f"Could not extract {dset_path}: {e}")
+                continue
+            if value is None:
+                continue
+            try:
+                metadata[dset_path] = _convert_to_json_serializable(value)
+            except Exception as e:
+                logger.debug(f"Could not serialize {dset_path}: {e}")
+    finally:
+        root = ds = None
+
     return metadata
+
+
+def _read_path_under_root(root_group, dset_path: str):
+    """Walk ``dset_path`` from ``root_group`` and return the MDArray value.
+
+    Returns ``None`` if any intermediate group or the leaf MDArray is
+    missing. Companion to :func:`_read_scalar_mdarray` for the case where
+    you've already opened the file and want to amortize cost across many
+    reads.
+    """
+    parts = [p for p in dset_path.split("/") if p]
+    if not parts:
+        return None
+    grp = root_group
+    ar = None
+    try:
+        for name in parts[:-1]:
+            grp = grp.OpenGroup(name)
+            if grp is None:
+                return None
+        ar = grp.OpenMDArray(parts[-1])
+        if ar is None:
+            return None
+        return _read_mdarray_value(ar)
+    finally:
+        ar = None
 
 
 def save_orbit_metadata_for_cslcs(
