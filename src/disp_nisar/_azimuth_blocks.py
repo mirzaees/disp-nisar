@@ -40,6 +40,9 @@ from dolphin._types import Bbox, Filename
 from dolphin.workflows import wrapped_phase
 from dolphin.workflows.config import DisplacementWorkflow
 from dolphin.workflows.displacement import OutputPaths
+from osgeo import gdal, osr
+
+gdal.UseExceptions()
 
 logger = logging.getLogger(__name__)
 
@@ -239,51 +242,51 @@ def build_full_frame_grid(
     )
 
 
-def _get_nisar_geotransform(
-    h5_file: Filename, frequency: str = "frequencyA"
-) -> tuple[float, float, float, float, float, float] | None:
-    """Read geotransform directly from NISAR HDF5 metadata.
+# def _get_nisar_geotransform(
+#     h5_file: Filename, frequency: str = "frequencyA"
+# ) -> tuple[float, float, float, float, float, float] | None:
+#     """Read geotransform directly from NISAR HDF5 metadata.
 
-    GDAL's HDF5 driver returns an identity matrix for NISAR files, so we need
-    to read the coordinates directly from the multidimensional metadata.
+#     GDAL's HDF5 driver returns an identity matrix for NISAR files, so we need
+#     to read the coordinates directly from the multidimensional metadata.
 
-    Parameters
-    ----------
-    h5_file : Filename
-        Path to NISAR GSLC HDF5 file
-    frequency : str
-        Frequency band to use (default: "frequencyA")
+#     Parameters
+#     ----------
+#     h5_file : Filename
+#         Path to NISAR GSLC HDF5 file
+#     frequency : str
+#         Frequency band to use (default: "frequencyA")
 
-    Returns
-    -------
-    tuple | None
-        6-element geotransform (left, x_res, x_rot, top, y_rot, -y_res)
-        or None if metadata cannot be read
+#     Returns
+#     -------
+#     tuple | None
+#         6-element geotransform (left, x_res, x_rot, top, y_rot, -y_res)
+#         or None if metadata cannot be read
 
-    """
-    import h5py
+#     """
+#     import h5py
 
-    try:
-        with h5py.File(h5_file, "r") as h5f:
-            grid_group = h5f[f"science/LSAR/GSLC/grids/{frequency}"]
+#     try:
+#         with h5py.File(h5_file, "r") as h5f:
+#             grid_group = h5f[f"science/LSAR/GSLC/grids/{frequency}"]
 
-            x_coords = grid_group["xCoordinates"][:]
-            y_coords = grid_group["yCoordinates"][:]
-            x_spacing = float(grid_group["xCoordinateSpacing"][()])
-            y_spacing = float(grid_group["yCoordinateSpacing"][()])
+#             x_coords = grid_group["xCoordinates"][:]
+#             y_coords = grid_group["yCoordinates"][:]
+#             x_spacing = float(grid_group["xCoordinateSpacing"][()])
+#             y_spacing = float(grid_group["yCoordinateSpacing"][()])
 
-            # NISAR coordinates are pixel centers
-            # Geotransform origin is top-left corner
-            left = float(x_coords.min()) - abs(x_spacing) / 2
-            top = float(y_coords.max()) + abs(y_spacing) / 2
+#             # NISAR coordinates are pixel centers
+#             # Geotransform origin is top-left corner
+#             left = float(x_coords.min()) - abs(x_spacing) / 2
+#             top = float(y_coords.max()) + abs(y_spacing) / 2
 
-            # Standard geotransform: (left, x_res, x_rot, top, y_rot, -y_res)
-            # Note: y_spacing is negative for north-up orientation
-            return (left, abs(x_spacing), 0.0, top, 0.0, -abs(y_spacing))
+#             # Standard geotransform: (left, x_res, x_rot, top, y_rot, -y_res)
+#             # Note: y_spacing is negative for north-up orientation
+#             return (left, abs(x_spacing), 0.0, top, 0.0, -abs(y_spacing))
 
-    except Exception as e:
-        logger.debug(f"Could not read NISAR geotransform from {h5_file}: {e}")
-        return None
+#     except Exception as e:
+#         logger.debug(f"Could not read NISAR geotransform from {h5_file}: {e}")
+#         return None
 
 
 def load_grid_from_nisar_gslc(
@@ -748,8 +751,6 @@ def _stage_input_to_local(
         Path to the staged GTiff with correct projection information
 
     """
-    from osgeo import gdal
-
     src_str = str(src_path)
     src_name = Path(src_str.split("://")[-1]).name  # strip /vsis3/ etc.
     stem = Path(src_name).stem
@@ -778,47 +779,62 @@ def _stage_input_to_local(
                 f"Empty window for block {block.block_index} against {src_str}: "
                 f"rows={rows}, read=[{block.read_start}, {block.read_stop})"
             )
-        gdal.Translate(
+        out_ds = gdal.Translate(
             str(out_path),
             src_ds,
             format="GTiff",
             srcWin=[0, y_off, cols, y_size],
             creationOptions=[
-                "COMPRESS=LZW",
                 "TILED=YES",
                 "BLOCKXSIZE=256",
                 "BLOCKYSIZE=256",
                 "BIGTIFF=IF_SAFER",
             ],
         )
+
+        gt = frame.geotransform
+        # Compute geotransform for this block's rows
+        block_geotransform = (
+            gt[0],  # X origin (left) - same as full frame
+            gt[1],  # X pixel size
+            gt[2],  # X rotation (typically 0)
+            gt[3] + block.read_start * gt[5],  # Y origin adjusted for block start
+            gt[4],  # Y rotation (typically 0)
+            gt[5],  # Y pixel size (negative for north-up)
+        )
+        out_ds.SetGeoTransform(block_geotransform)
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(frame.epsg)
+        out_ds.SetProjection(srs.ExportToWkt())
     finally:
-        src_ds = None
+        src_ds.Close()
+        # src_ds = None
 
-    # Update geotransform to match frame grid exactly
-    # This ensures the block's output has correct georeferencing in the
-    # projection specified by frame.epsg
-    out_ds = gdal.Open(str(out_path), gdal.GA_Update)
-    if out_ds is not None:
-        try:
-            gt = frame.geotransform
-            # Compute geotransform for this block's rows
-            block_geotransform = (
-                gt[0],  # X origin (left) - same as full frame
-                gt[1],  # X pixel size
-                gt[2],  # X rotation (typically 0)
-                gt[3] + block.read_start * gt[5],  # Y origin adjusted for block start
-                gt[4],  # Y rotation (typically 0)
-                gt[5],  # Y pixel size (negative for north-up)
-            )
-            out_ds.SetGeoTransform(block_geotransform)
-            # Also ensure projection is set (some HDF5 sources may lack it)
-            from osgeo import osr
+    # # Update geotransform to match frame grid exactly
+    # # This ensures the block's output has correct georeferencing in the
+    # # projection specified by frame.epsg
+    # out_ds = gdal.Open(str(out_path), gdal.GA_Update)
+    # if out_ds is not None:
+    #     try:
+    #         gt = frame.geotransform
+    #         # Compute geotransform for this block's rows
+    #         block_geotransform = (
+    #             gt[0],  # X origin (left) - same as full frame
+    #             gt[1],  # X pixel size
+    #             gt[2],  # X rotation (typically 0)
+    #             gt[3] + block.read_start * gt[5],  # Y origin adjusted for block start
+    #             gt[4],  # Y rotation (typically 0)
+    #             gt[5],  # Y pixel size (negative for north-up)
+    #         )
+    #         out_ds.SetGeoTransform(block_geotransform)
+    #         # Also ensure projection is set (some HDF5 sources may lack it)
+    #         from osgeo import osr
 
-            srs = osr.SpatialReference()
-            srs.ImportFromEPSG(frame.epsg)
-            out_ds.SetProjection(srs.ExportToWkt())
-        finally:
-            out_ds = None
+    #         srs = osr.SpatialReference()
+    #         srs.ImportFromEPSG(frame.epsg)
+    #         out_ds.SetProjection(srs.ExportToWkt())
+    #     finally:
+    #         out_ds = None
 
     return out_path
 
@@ -1149,7 +1165,21 @@ def stitch_full_frame(
     network / ministacks, just evaluated over different azimuth windows.
     """
     from dolphin import stitching
-    from dolphin.io import DEFAULT_TIFF_OPTIONS, EXTRA_COMPRESSED_TIFF_OPTIONS
+    from dolphin.io import EXTRA_COMPRESSED_TIFF_OPTIONS  # DEFAULT_TIFF_OPTIONS
+
+    DEFAULT_TIFF_OPTIONS_RIO = [
+        "COMPRESS=ZSTD",
+        "ZSTD_LEVEL=1",  # fast, still ~LZW-level
+        "PREDICTOR=2",  # or 3 for floats; skip for complex types
+        "TILED=YES",
+        "BLOCKXSIZE=256",
+        "BLOCKYSIZE=256",
+        "BIGTIFF=IF_SAFER",
+        "NUM_THREADS=ALL_CPUS",
+    ]
+    DEFAULT_TIFF_OPTIONS = tuple(
+        f"{k.upper()}={v}" for k, v in DEFAULT_TIFF_OPTIONS_RIO.items()
+    )
 
     if len(block_outputs) != len(blocks):
         raise ValueError(
