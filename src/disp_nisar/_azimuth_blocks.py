@@ -1167,7 +1167,7 @@ def stitch_full_frame(
     from dolphin import stitching
     from dolphin.io import EXTRA_COMPRESSED_TIFF_OPTIONS  # DEFAULT_TIFF_OPTIONS
 
-    DEFAULT_TIFF_OPTIONS_RIO = [
+    DEFAULT_TIFF_OPTIONS = [
         "COMPRESS=ZSTD",
         "ZSTD_LEVEL=1",  # fast, still ~LZW-level
         "PREDICTOR=2",  # or 3 for floats; skip for complex types
@@ -1177,9 +1177,6 @@ def stitch_full_frame(
         "BIGTIFF=IF_SAFER",
         "NUM_THREADS=ALL_CPUS",
     ]
-    DEFAULT_TIFF_OPTIONS = tuple(
-        f"{k.upper()}={v}" for k, v in DEFAULT_TIFF_OPTIONS_RIO.items()
-    )
 
     if len(block_outputs) != len(blocks):
         raise ValueError(
