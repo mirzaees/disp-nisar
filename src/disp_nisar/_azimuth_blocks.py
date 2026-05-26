@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import NamedTuple, Sequence
 
 from dolphin import interferogram, io
-from dolphin._types import Bbox, Filename
+from dolphin._types import Bbox
 from dolphin.workflows import wrapped_phase
 from dolphin.workflows.config import DisplacementWorkflow
 from dolphin.workflows.displacement import OutputPaths
@@ -785,6 +785,8 @@ def _stage_input_to_local(
             format="GTiff",
             srcWin=[0, y_off, cols, y_size],
             creationOptions=[
+                "COMPRESS=ZSTD",
+                "ZSTD_LEVEL=1",
                 "TILED=YES",
                 "BLOCKXSIZE=256",
                 "BLOCKYSIZE=256",
@@ -870,7 +872,6 @@ def _stage_inputs_for_block(
         Staged file paths and new subdataset value
 
     """
-    t0 = time.perf_counter()
     staging_dir.mkdir(parents=True, exist_ok=True)
     subdataset = cfg.input_options.subdataset
     staged: list[Path] = []
@@ -883,13 +884,6 @@ def _stage_inputs_for_block(
         )
     # All files are staged as GTiffs, so no subdataset
     new_subdataset = None
-    logger.info(
-        "staging block completed",
-        extra={
-            "block": block,
-            "elapsed": time.perf_counter() - t0,
-        },
-    )
     return staged, new_subdataset
 
 
@@ -924,6 +918,7 @@ def run_phase_linking_block(
     polygon-based nodata mask across the block split, since staged GTiffs
     otherwise carry no bounding-polygon metadata.
     """
+    t0 = time.perf_counter()
     block_work_dir = shard_dir / f"block_{block.block_index:02d}"
     block_work_dir.mkdir(parents=True, exist_ok=True)
     block_cfg = _narrow_cfg_for_block(cfg, frame, block, block_work_dir)
@@ -931,6 +926,13 @@ def run_phase_linking_block(
     staging_dir = block_work_dir / "staged_inputs"
     staged_files, new_subdataset = _stage_inputs_for_block(
         cfg, block, staging_dir, frame
+    )
+    logger.info(
+        "staging block completed",
+        extra={
+            "block": block,
+            "elapsed": time.perf_counter() - t0,
+        },
     )
     if staged_files != list(cfg.cslc_file_list):
         logger.info(
@@ -1028,7 +1030,8 @@ def run_phase_linking_block(
             reference_point=None,
         )
     finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        print(staging_dir)
+        # shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def _stem_looks_like_nisar(p: object) -> bool:

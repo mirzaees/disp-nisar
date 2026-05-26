@@ -33,6 +33,10 @@ from opera_utils import (
 from . import __version__ as disp_nisar_version
 from ._baselines import _interpolate_data, compute_baselines
 from ._common import DATETIME_FORMAT, NISAR_DATASET_NAME, NISAR_IDENTIFICATION_GROUP
+from ._orbit_cache import (
+    copy_cslc_metadata_to_compressed,
+    copy_cslc_metadata_to_displacement,
+)
 from ._reference import ReferencePoint
 from ._utils import extract_footprint
 from .browse_image import make_browse_image_from_arr
@@ -2069,158 +2073,158 @@ def _copy_hdf5_dsets(
                 src.copy(src[dset_path], dst[out_group], name=new_name)
 
 
-def copy_cslc_metadata_to_compressed(
-    opera_cslc_file: Filename,
-    output_hdf5_file: Filename,
-    cache_dir: Path | None = None,
-) -> None:
-    """Copy orbit and metadata datasets from the input CSLC file to the compressed SLC.
+# def copy_cslc_metadata_to_compressed(
+#     opera_cslc_file: Filename,
+#     output_hdf5_file: Filename,
+#     cache_dir: Path | None = None,
+# ) -> None:
+#     """Copy orbit and metadata datasets from the input CSLC file to the compressed SLC.
 
-    Parameters
-    ----------
-    opera_cslc_file : Filename
-        Path to the input CSLC file.
-    output_hdf5_file : Filename
-        Path to the output compressed SLC file.
-    cache_dir : Path | None
-        Directory containing cached metadata. If provided and exists,
-        will load from cache instead of accessing CSLC file.
+#     Parameters
+#     ----------
+#     opera_cslc_file : Filename
+#         Path to the input CSLC file.
+#     output_hdf5_file : Filename
+#         Path to the output compressed SLC file.
+#     cache_dir : Path | None
+#         Directory containing cached metadata. If provided and exists,
+#         will load from cache instead of accessing CSLC file.
 
-    """
-    # TODO: this function requires NISAR datasets and it should be based on frequency
-    # and polarization. Hardcoding for now
-    # Note: orbit group handled separately - has complex structure
-    orbit_group = "/science/LSAR/GSLC/metadata/orbit"
-    dsets_to_copy = [
-        "/science/LSAR/GSLC/metadata/sourceData/swaths/frequencyA/centerFrequency",
-        "/science/LSAR/GSLC/metadata/sourceData/processingInformation/parameters/frequencyA/slantRange",
-        "/science/LSAR/identification/productSpecificationVersion",
-        "/science/LSAR/identification/productVersion",
-        "/science/LSAR/identification/zeroDopplerEndTime",
-        "/science/LSAR/identification/zeroDopplerStartTime",
-        "/science/LSAR/identification/boundingPolygon",
-        "/science/LSAR/identification/missionId",
-        "/science/LSAR/identification/lookDirection",
-        "/science/LSAR/identification/trackNumber",
-        "/science/LSAR/identification/orbitPassDirection",
-        "/science/LSAR/identification/absoluteOrbitNumber",
-        "/science/LSAR/GSLC/metadata/orbit/orbitType",
-    ]
+#     """
+#     # TODO: this function requires NISAR datasets and it should be based on frequency
+#     # and polarization. Hardcoding for now
+#     # Note: orbit group handled separately - has complex structure
+#     orbit_group = "/science/LSAR/GSLC/metadata/orbit"
+#     dsets_to_copy = [
+#         "/science/LSAR/GSLC/metadata/sourceData/swaths/frequencyA/centerFrequency",
+#         "/science/LSAR/GSLC/metadata/sourceData/processingInformation/parameters/frequencyA/slantRange",
+#         "/science/LSAR/identification/productSpecificationVersion",
+#         "/science/LSAR/identification/productVersion",
+#         "/science/LSAR/identification/zeroDopplerEndTime",
+#         "/science/LSAR/identification/zeroDopplerStartTime",
+#         "/science/LSAR/identification/boundingPolygon",
+#         "/science/LSAR/identification/missionId",
+#         "/science/LSAR/identification/lookDirection",
+#         "/science/LSAR/identification/trackNumber",
+#         "/science/LSAR/identification/orbitPassDirection",
+#         "/science/LSAR/identification/absoluteOrbitNumber",
+#         "/science/LSAR/GSLC/metadata/orbit/orbitType",
+#     ]
 
-    # Try cache first if available
-    if cache_dir is not None and cache_dir.exists():
-        from ._orbit_cache import copy_cached_metadata_to_file
+#     # Try cache first if available
+#     if cache_dir is not None and cache_dir.exists():
+#         from ._orbit_cache import copy_cached_metadata_to_file
 
-        try:
-            # Copy simple datasets from cache
-            copy_cached_metadata_to_file(
-                cache_dir=cache_dir,
-                cslc_filename=opera_cslc_file,
-                output_file=output_hdf5_file,
-                dsets_to_copy=dsets_to_copy,
-            )
+#         try:
+#             # Copy simple datasets from cache
+#             copy_cached_metadata_to_file(
+#                 cache_dir=cache_dir,
+#                 cslc_filename=opera_cslc_file,
+#                 output_file=output_hdf5_file,
+#                 dsets_to_copy=dsets_to_copy,
+#             )
 
-            # Copy orbit group directly from file (complex structure)
-            try:
-                _copy_hdf5_dsets(
-                    source_file=opera_cslc_file,
-                    dest_file=output_hdf5_file,
-                    dsets_to_copy=[(orbit_group, None)],
-                )
-            except Exception as e:
-                logger.warning(f"Failed to copy orbit group: {e}")
+#             # Copy orbit group directly from file (complex structure)
+#             try:
+#                 _copy_hdf5_dsets(
+#                     source_file=opera_cslc_file,
+#                     dest_file=output_hdf5_file,
+#                     dsets_to_copy=[(orbit_group, None)],
+#                 )
+#             except Exception as e:
+#                 logger.warning(f"Failed to copy orbit group: {e}")
 
-            logger.debug(
-                f"Copied metadata from cache to {output_hdf5_file} for"
-                f" {opera_cslc_file}"
-            )
-            return
-        except Exception as e:
-            logger.warning(
-                f"Failed to copy from cache, falling back to file access: {e}"
-            )
+#             logger.debug(
+#                 f"Copied metadata from cache to {output_hdf5_file} for"
+#                 f" {opera_cslc_file}"
+#             )
+#             return
+#         except Exception as e:
+#             logger.warning(
+#                 f"Failed to copy from cache, falling back to file access: {e}"
+#             )
 
-    # Fallback to direct file copying (including orbit group)
-    all_dsets = [orbit_group] + dsets_to_copy
-    dsets_to_copy_tuples = [(dset, None) for dset in all_dsets]
-    _copy_hdf5_dsets(
-        source_file=opera_cslc_file,
-        dest_file=output_hdf5_file,
-        dsets_to_copy=dsets_to_copy_tuples,
-    )
-    logger.debug(f"Copied metadata from {opera_cslc_file} to {output_hdf5_file}")
+#     # Fallback to direct file copying (including orbit group)
+#     all_dsets = [orbit_group] + dsets_to_copy
+#     dsets_to_copy_tuples = [(dset, None) for dset in all_dsets]
+#     _copy_hdf5_dsets(
+#         source_file=opera_cslc_file,
+#         dest_file=output_hdf5_file,
+#         dsets_to_copy=dsets_to_copy_tuples,
+#     )
+#     logger.debug(f"Copied metadata from {opera_cslc_file} to {output_hdf5_file}")
 
 
-def copy_cslc_metadata_to_displacement(
-    reference_cslc_file: Filename,
-    secondary_cslc_file: Filename,
-    output_disp_file: Filename,
-    cache_dir: Path | None = None,
-) -> None:
-    """Copy metadata from input reference/secondary CSLC files to DISP output.
+# def copy_cslc_metadata_to_displacement(
+#     reference_cslc_file: Filename,
+#     secondary_cslc_file: Filename,
+#     output_disp_file: Filename,
+#     cache_dir: Path | None = None,
+# ) -> None:
+#     """Copy metadata from input reference/secondary CSLC files to DISP output.
 
-    Parameters
-    ----------
-    reference_cslc_file : Filename
-        Path to reference CSLC file
-    secondary_cslc_file : Filename
-        Path to secondary CSLC file
-    output_disp_file : Filename
-        Path to output displacement file
-    cache_dir : Path | None
-        Directory containing cached metadata. If provided and exists,
-        will load from cache instead of accessing CSLC files.
+#     Parameters
+#     ----------
+#     reference_cslc_file : Filename
+#         Path to reference CSLC file
+#     secondary_cslc_file : Filename
+#         Path to secondary CSLC file
+#     output_disp_file : Filename
+#         Path to output displacement file
+#     cache_dir : Path | None
+#         Directory containing cached metadata. If provided and exists,
+#         will load from cache instead of accessing CSLC files.
 
-    """
-    # Note: orbit group cannot be easily cached due to complex HDF5 structure,
-    # so we skip it here. If needed, could be added to cache in the future.
-    dsets_to_copy = ["/metadata/orbit"]  # Group
+#     """
+#     # Note: orbit group cannot be easily cached due to complex HDF5 structure,
+#     # so we skip it here. If needed, could be added to cache in the future.
+#     dsets_to_copy = ["/metadata/orbit"]  # Group
 
-    # Copy orbit groups with prepended names (these may not be in cache)
-    for cslc_file, prepend_str in zip(
-        [reference_cslc_file, secondary_cslc_file], ["reference_", "secondary_"]
-    ):
-        try:
-            _copy_hdf5_dsets(
-                source_file=cslc_file,
-                dest_file=output_disp_file,
-                dsets_to_copy=[(dset, None) for dset in dsets_to_copy],
-                prepend_str=prepend_str,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to copy orbit group from {cslc_file}: {e}")
+#     # Copy orbit groups with prepended names (these may not be in cache)
+#     for cslc_file, prepend_str in zip(
+#         [reference_cslc_file, secondary_cslc_file], ["reference_", "secondary_"]
+#     ):
+#         try:
+#             _copy_hdf5_dsets(
+#                 source_file=cslc_file,
+#                 dest_file=output_disp_file,
+#                 dsets_to_copy=[(dset, None) for dset in dsets_to_copy],
+#                 prepend_str=prepend_str,
+#             )
+#         except Exception as e:
+#             logger.warning(f"Failed to copy orbit group from {cslc_file}: {e}")
 
-    # Add ones which should be same for both ref/sec
-    common_dsets = [
-        "/science/LSAR/identification/lookDirection",
-        "/science/LSAR/identification/trackNumber",
-        "/science/LSAR/identification/orbitPassDirection",
-    ]
+#     # Add ones which should be same for both ref/sec
+#     common_dsets = [
+#         "/science/LSAR/identification/lookDirection",
+#         "/science/LSAR/identification/trackNumber",
+#         "/science/LSAR/identification/orbitPassDirection",
+#     ]
 
-    # Try cache first if available
-    if cache_dir is not None and cache_dir.exists():
-        from ._orbit_cache import copy_cached_metadata_to_file
+#     # Try cache first if available
+#     if cache_dir is not None and cache_dir.exists():
+#         from ._orbit_cache import copy_cached_metadata_to_file
 
-        try:
-            copy_cached_metadata_to_file(
-                cache_dir=cache_dir,
-                cslc_filename=reference_cslc_file,
-                output_file=output_disp_file,
-                dsets_to_copy=common_dsets,
-            )
-            logger.debug(f"Copied common metadata from cache to {output_disp_file}")
-            return
-        except Exception as e:
-            logger.warning(
-                f"Failed to copy from cache, falling back to file access: {e}"
-            )
+#         try:
+#             copy_cached_metadata_to_file(
+#                 cache_dir=cache_dir,
+#                 cslc_filename=reference_cslc_file,
+#                 output_file=output_disp_file,
+#                 dsets_to_copy=common_dsets,
+#             )
+#             logger.debug(f"Copied common metadata from cache to {output_disp_file}")
+#             return
+#         except Exception as e:
+#             logger.warning(
+#                 f"Failed to copy from cache, falling back to file access: {e}"
+#             )
 
-    # Fallback to direct file copying
-    _copy_hdf5_dsets(
-        source_file=reference_cslc_file,
-        dest_file=output_disp_file,
-        dsets_to_copy=[(dset, None) for dset in common_dsets],
-    )
+#     # Fallback to direct file copying
+#     _copy_hdf5_dsets(
+#         source_file=reference_cslc_file,
+#         dest_file=output_disp_file,
+#         dsets_to_copy=[(dset, None) for dset in common_dsets],
+#     )
 
 
 def create_compressed_products(
