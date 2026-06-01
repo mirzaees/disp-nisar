@@ -99,6 +99,25 @@ class WorkerSettings(DolphinWorkerSettings):
             " compatibility. Recommended: 50-75% of available cores."
         ),
     )
+    n_azimuth_blocks: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Number of azimuth blocks to split each frame into. 1 disables the"
+            " split (single-shot full-frame run). dolphin processes each block as"
+            " a synthetic burst; maps to `input_options.azimuth_blocks`."
+        ),
+    )
+    azimuth_block_halo: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Halo (input rows) kept on each side of an azimuth block so boundary"
+            " pixels see the full spatial neighborhood. None lets dolphin derive a"
+            " default from the phase-linking / similarity / correlation windows."
+            " Maps to `input_options.halo_rows`."
+        ),
+    )
 
     def model_post_init(self, __context, /):
         """Copy num_parallel_workers to n_parallel_bursts if provided."""
@@ -261,56 +280,6 @@ class ProductPathGroup(YamlModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class AzimuthBlockOptions(YamlModel):
-    """Options for splitting a frame into azimuth blocks during phase linking.
-
-    When `num_blocks > 1`, disp-nisar runs the phase-linking stage per azimuth
-    block, assembles the results into a full-frame scratch, then runs
-    unwrapping + timeseries + products once on the full frame.
-
-    The per-block halo is derived from `phase_linking.half_window` (using the
-    maximum of its x/y components) so each block's central rows are computed
-    with the same neighborhood they would see in a monolithic run.
-    """
-
-    num_blocks: int = Field(
-        default=1,
-        ge=1,
-        description=(
-            "Number of azimuth blocks to split the frame into for phase linking."
-            " 1 disables the split (single-shot full-frame run)."
-        ),
-    )
-    block_index: Optional[int] = Field(
-        default=None,
-        description=(
-            "Execution-mode selector. None runs all blocks in this process then"
-            " assembles + unwraps + TS + products. An integer in [0, num_blocks)"
-            " runs only that block and exits (batch worker mode). -1 skips"
-            " phase linking, assembles pre-existing shards, and runs the rest"
-            " (batch finalize mode)."
-        ),
-    )
-    n_parallel_blocks: int = Field(
-        default=1,
-        ge=1,
-        description=(
-            "When block_index is None, number of blocks to run in parallel via a"
-            " ProcessPoolExecutor. 1 = sequential. Stacks multiplicatively with"
-            " any internal dolphin parallelism, so keep the total worker count"
-            " bounded by available cores."
-        ),
-    )
-    shard_dir: Optional[Path] = Field(
-        default=None,
-        description=(
-            "Directory where per-block phase-linking outputs are written/read."
-            " Defaults to `<scratch>/blocks/` when None. Set explicitly when"
-            " coordinating across batch instances via a shared/synced location."
-        ),
-    )
-
-
 class AlgorithmParameters(YamlModel):
     """Class containing all the other `DisplacementWorkflow` classes."""
 
@@ -323,7 +292,6 @@ class AlgorithmParameters(YamlModel):
     unwrap_options: UnwrapOptions = Field(default_factory=UnwrapOptions)
     timeseries_options: TimeseriesOptions = Field(default_factory=TimeseriesOptions)
     output_options: OutputOptions = Field(default_factory=OutputOptions)
-    azimuth_blocks: AzimuthBlockOptions = Field(default_factory=AzimuthBlockOptions)
 
     subdataset: str = Field(
         default=NISAR_DATASET_NAME,
@@ -520,6 +488,10 @@ class RunConfig(YamlModel):
         input_options = {
             "subdataset": nisar_dataset_name,
             "wavelength": wavelength,
+            # Azimuth-block splitting is handled internally by dolphin; the block
+            # count and halo come from the worker settings.
+            "azimuth_blocks": self.worker_settings.n_azimuth_blocks,
+            "halo_rows": self.worker_settings.azimuth_block_halo,
         }  # param_dict.pop("subdataset")}
         param_dict["output_options"]["epsg"] = bounds_epsg
         param_dict["output_options"]["bounds"] = bounds
@@ -637,7 +609,11 @@ class RunConfig(YamlModel):
                 sas_output_path=output_directory,
                 save_compressed_slc=save_compressed_slc,
             ),
-            worker_settings=workflow.worker_settings,
+            worker_settings=WorkerSettings(
+                **workflow.worker_settings.model_dump(),
+                n_azimuth_blocks=workflow.input_options.azimuth_blocks,
+                azimuth_block_halo=workflow.input_options.halo_rows,
+            ),
             log_file=workflow.log_file,
         )
 

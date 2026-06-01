@@ -82,6 +82,15 @@ worker_settings:
   # Example: For 32-core machine, use 16-24 workers.
   #   Type: integer.
   num_parallel_workers: 1
+  # Number of azimuth blocks to split each frame into. 1 disables the split (single-shot
+  #   full-frame run). dolphin processes each block as a synthetic burst.
+  #   Type: integer.
+  n_azimuth_blocks: 1
+  # Halo (input rows) kept on each side of an azimuth block so boundary pixels see the full
+  #   spatial neighborhood. Empty/null lets dolphin derive a default from the phase-linking /
+  #   similarity / correlation windows.
+  #   Type: integer | null.
+  azimuth_block_halo:
   # Size (rows, columns) of blocks of data to load at a time.
   #   Type: array.
   block_shape:

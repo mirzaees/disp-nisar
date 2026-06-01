@@ -21,20 +21,10 @@ from dolphin.workflows.displacement import run as run_displacement
 from opera_utils import get_dates, group_by_date
 
 from disp_nisar import __version__, product
-from disp_nisar._azimuth_blocks import (
-    _run_phase_linking_blocks,
-    build_frame_nodata_mask,
-    compute_block_windows,
-    load_block_outputs_from_shards,
-    load_grid_from_nisar_gslc,
-    resolve_overlap,
-    run_full_frame_unwrap_and_timeseries,
-    run_phase_linking_block,
-    stitch_full_frame,
-)
 from disp_nisar._masking import (
     create_mask_from_distance,  # , create_layover_shadow_masks
 )
+from disp_nisar._staging import build_frame_nodata_mask, stage_inputs_to_local
 from disp_nisar._ps import precompute_ps
 from disp_nisar.ionosphere import read_ionosphere_phase_screen
 from disp_nisar.pge_runconfig import AlgorithmParameters, RunConfig
@@ -134,30 +124,13 @@ def run(
         # Drop the PS threshold to a conservative number to avoid false positives
         cfg.ps_options.amp_dispersion_threshold = 0.15
 
-    # Run dolphin's displacement workflow, optionally split into azimuth blocks.
-    algorithm_parameters = AlgorithmParameters.from_yaml(
-        pge_runconfig.dynamic_ancillary_file_group.algorithm_parameters_file
-    )
-    az_opts = algorithm_parameters.azimuth_blocks
-
-    if az_opts.num_blocks <= 1:
-        # Single-shot full-frame path (backward compatible).
-        out_paths = run_displacement(cfg=cfg, debug=debug)
-    else:
-        out_paths = _run_azimuth_blocked(
-            cfg=cfg,
-            pge_runconfig=pge_runconfig,
-            az_opts=az_opts,
-            debug=debug,
-        )
-        if out_paths is None:
-            # Batch worker mode: shards were written, no further stages run.
-            logger.info(
-                "Azimuth block worker finished (block_index=%s); exiting before"
-                " unwrap/timeseries/products.",
-                az_opts.block_index,
-            )
-            return
+    # Stage every input once into a compact local NISAR HDF5 holding only the
+    # required layers, then let dolphin perform azimuth-block splitting
+    # internally. The block count + halo were set on `cfg.input_options`
+    # (azimuth_blocks / halo_rows) by `RunConfig.to_workflow` from the worker
+    # settings, so nothing further is needed here.
+    _stage_and_prepare_inputs(cfg=cfg, pge_runconfig=pge_runconfig)
+    out_paths = run_displacement(cfg=cfg, debug=debug)
 
     assert out_paths.timeseries_paths is not None
     assert out_paths.timeseries_residual_paths is not None
@@ -213,71 +186,34 @@ def run(
     logger.info(f"Current running disp_nisar version: {__version__}")
 
 
-def _run_azimuth_blocked(
+def _stage_and_prepare_inputs(
     cfg: DisplacementWorkflow,
     pge_runconfig: RunConfig,
-    az_opts,
-    debug: bool,
-):
-    """Orchestrate the azimuth-block split.
+) -> None:
+    """Stage inputs once and prepare the frame for dolphin's block processing.
 
-    Returns a full-frame `OutputPaths` ready for `create_products`, or `None`
-    if this process is a batch worker that should exit after writing shards.
+    Mutates ``cfg`` in place:
+
+    * rewrites ``cslc_file_list`` to compact local NISAR HDF5s carrying only the
+      required layers (raster + grid geo + identification/orbit/sourceData
+      metadata), so the staged files are self-sufficient for product creation —
+      no separate orbit cache is needed,
+    * builds the frame-wide nodata mask and (when a DEM is given) the geometry
+      layers, and registers the masks via ``layover_shadow_mask_files``.
+
+    Azimuth-block splitting itself is handled by dolphin via
+    ``cfg.input_options.azimuth_blocks`` / ``halo_rows``, which are set from the
+    worker settings in :meth:`RunConfig.to_workflow`.
     """
-    # Read the authoritative native raster grid from the first *non-compressed*
-    # GSLC. Compressed SLCs from prior ministacks can have different raster
-    # dimensions; using one of those here misaligns block windows from the
-    # frame nodata mask (which is built from non-compressed inputs) and breaks
-    # combine_mask_files. EPSG comes from the frame config — NISAR GSLC WKTs
-    # can lack an AUTHORITY tag, defeating AutoIdentifyEPSG.
-    _first_non_compressed = next(
-        (f for f in cfg.cslc_file_list if "compressed" not in str(f).lower()),
-        None,
-    )
-    if _first_non_compressed is None:
-        raise ValueError(
-            "cfg.cslc_file_list contains only compressed SLCs; need at least"
-            " one non-compressed GSLC to determine the frame grid"
-        )
-    frame = load_grid_from_nisar_gslc(
-        _first_non_compressed,
+    # Stage every input once into a compact local HDF5 (required layers only).
+    staged = stage_inputs_to_local(
+        cfg.cslc_file_list,
         subdataset=cfg.input_options.subdataset,
-        epsg=int(cfg.output_options.bounds_epsg or cfg.output_options.epsg),
+        out_dir=cfg.work_directory / "staged_inputs",
     )
+    cfg.cslc_file_list = staged
 
-    # Save orbit data and metadata for all CSLC files for baseline computation
-    from disp_nisar._orbit_cache import save_orbit_metadata_for_cslcs
-
-    orbit_cache_dir = cfg.work_directory / "orbit_cache"
-    save_orbit_metadata_for_cslcs(
-        cslc_files=cfg.cslc_file_list,
-        subdataset=cfg.input_options.subdataset,
-        output_dir=orbit_cache_dir,
-    )
-    logger.info(f"Saved orbit metadata to {orbit_cache_dir}")
-
-    # Geometry layers created after nodata mask (defines frame grid)
-    geometry_dir = cfg.work_directory / "geometry"
-    layover_shadow_mask = None
-
-    overlap = resolve_overlap(cfg)
-    blocks = compute_block_windows(
-        total_rows=frame.rows, num_blocks=az_opts.num_blocks, overlap=overlap
-    )
-    shard_dir = Path(az_opts.shard_dir or cfg.work_directory / "blocks")
-    shard_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(
-        "Azimuth-block split: %d blocks over %d rows, halo=%d, shard_dir=%s",
-        len(blocks),
-        frame.rows,
-        overlap,
-        shard_dir,
-    )
-
-    # Pre-build the frame-wide nodata mask from the *original* NISAR HDF5s,
-    # BEFORE any per-block staging rewrites cfg.cslc_file_list to GTiffs that
-    # no longer carry the NISAR bounding polygon. Each block crops this to its
-    # own azimuth window.
+    # Frame-wide nodata mask from the staged GSLCs' bounding polygons.
     frame_nodata_mask = build_frame_nodata_mask(
         cslc_file_list=cfg.cslc_file_list,
         subdataset=cfg.input_options.subdataset,
@@ -285,82 +221,43 @@ def _run_azimuth_blocked(
     )
     if frame_nodata_mask is None:
         logger.warning(
-            "No frame nodata mask available; each block will rely on the"
-            " bounds mask alone."
+            "No frame nodata mask available; relying on the bounds mask alone."
         )
 
-    # If we have a nodata mask but no geometry layers yet, create them now
-    # Use the nodata mask as the template since it has the correct frame grid
-    if (
-        frame_nodata_mask is not None
-        and layover_shadow_mask is None
-        and pge_runconfig.dynamic_ancillary_file_group.dem_file is not None
-    ):
+    masks: list[Path] = []
+    if frame_nodata_mask is not None:
+        masks.append(frame_nodata_mask)
+
+    # Geometry layers (optional). create_products consumes them if present.
+    dem_file = pge_runconfig.dynamic_ancillary_file_group.dem_file
+    if frame_nodata_mask is not None and dem_file is not None:
         from disp_nisar._geometry import prepare_geometry_layers
 
+        first_non_compressed = next(
+            (f for f in cfg.cslc_file_list if "compressed" not in str(f).lower()),
+            None,
+        )
         try:
             logger.info(
                 "Creating geometry layers using nodata mask as frame grid template"
             )
             geometry_layers = prepare_geometry_layers(
-                gslc_path=_first_non_compressed,
-                dem_path=pge_runconfig.dynamic_ancillary_file_group.dem_file,
-                output_dir=geometry_dir,
-                template_raster=frame_nodata_mask,  # Use nodata mask as template
+                gslc_path=first_non_compressed,
+                dem_path=dem_file,
+                output_dir=cfg.work_directory / "geometry",
+                template_raster=frame_nodata_mask,
                 n_workers=cfg.worker_settings.n_parallel_bursts or 4,
             )
             layover_shadow_mask = geometry_layers.get("layover_shadow_mask")
-            logger.info(f"Geometry layers saved to {geometry_dir}")
-        except Exception as e:
+            if layover_shadow_mask is not None:
+                masks.append(layover_shadow_mask)
+            logger.info("Geometry layers saved to %s", cfg.work_directory / "geometry")
+        except Exception as e:  # noqa: BLE001 — geometry is optional
             logger.warning(f"Failed to prepare geometry layers: {e}", exc_info=True)
             logger.warning("Continuing without geometry layers")
 
-    if layover_shadow_mask is not None:
-        logger.info(
-            f"Using layover/shadow mask for block processing: {layover_shadow_mask}"
-        )
-
-    block_index = az_opts.block_index
-
-    if block_index is not None and block_index >= 0:
-        # Single-block worker: run one block and stop.
-        if block_index >= len(blocks):
-            raise ValueError(
-                f"block_index={block_index} out of range for num_blocks={len(blocks)}"
-            )
-        run_phase_linking_block(
-            cfg,
-            frame,
-            blocks[block_index],
-            shard_dir,
-            debug=debug,
-            frame_nodata_mask=frame_nodata_mask,
-            layover_shadow_mask=layover_shadow_mask,
-        )
-        return None
-
-    if block_index == -1:
-        # Finalize: expect all shards to exist.
-        block_outputs = load_block_outputs_from_shards(shard_dir, len(blocks))
-    else:
-        # Local mode: run every block in this process.
-        block_outputs = _run_phase_linking_blocks(
-            cfg=cfg,
-            frame=frame,
-            blocks=blocks,
-            shard_dir=shard_dir,
-            n_parallel=az_opts.n_parallel_blocks,
-            debug=debug,
-            frame_nodata_mask=frame_nodata_mask,
-            layover_shadow_mask=layover_shadow_mask,
-        )
-
-    stitched = stitch_full_frame(
-        block_outputs=block_outputs,
-        blocks=blocks,
-        out_dir=cfg.work_directory,
-    )
-    return run_full_frame_unwrap_and_timeseries(cfg, stitched)
+    if masks:
+        cfg.layover_shadow_mask_files = masks
 
 
 def create_products(

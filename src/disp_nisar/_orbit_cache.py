@@ -415,6 +415,41 @@ def _copy_orbit_from_npz_cache(
         return False
 
 
+def _copy_orbit_from_source(
+    cslc_filename: str | Path,
+    dst_h5: h5py.File,
+    orbit_group_base_path: str = "/science/LSAR/GSLC/metadata",
+    prepend_str: str = "",
+) -> bool:
+    """Read orbit arrays directly from a (local) staged GSLC and write them.
+
+    Mirrors the HDF5 orbit structure previously reconstructed from the .npz
+    cache, but sources the data straight from the staged file's orbit group.
+    Used now that staged inputs are local and self-sufficient (no orbit cache).
+    """
+    try:
+        times, positions, velocities, reference_epoch = get_orbit_arrays(cslc_filename)
+    except Exception as e:  # noqa: BLE001 — missing/unreadable orbit group
+        logger.warning(f"Failed to read orbit arrays from {cslc_filename}: {e}")
+        return False
+
+    group_name = f"{prepend_str}orbit" if prepend_str else "orbit"
+    full_orbit_path = f"{orbit_group_base_path}/{group_name}"
+    grp = dst_h5.require_group(full_orbit_path)
+    for item in ["time", "position", "velocity"]:
+        if item in grp:
+            del grp[item]
+
+    time_dset = grp.create_dataset("time", data=times)
+    grp.create_dataset("position", data=positions)
+    grp.create_dataset("velocity", data=velocities)
+
+    ref_epoch_iso = reference_epoch.isoformat()
+    time_dset.attrs["units"] = np.bytes_(f"seconds since {ref_epoch_iso}")
+    time_dset.attrs["calendar"] = np.bytes_("proleptic_gregorian")
+    return True
+
+
 def load_metadata(cache_dir: Path, cslc_filename: Filename) -> dict | None:
     """Load cached metadata for a CSLC file.
 
@@ -673,111 +708,90 @@ def copy_cslc_metadata_to_compressed(
     output_hdf5_file : str | Path
         Path to the destination local compressed HDF5 file.
     cache_dir : Path | None
-        Directory path containing pre-calculated .npz orbit structures.
+        Unused. Retained for backward compatibility; orbit and metadata are now
+        read directly from the (local, self-sufficient) staged source file.
     """
-    if cache_dir is not None and cache_dir.exists():
-        # from osgeo import gdal
+    dsets_to_copy = [
+        "/science/LSAR/GSLC/metadata/sourceData/swaths/frequencyA/centerFrequency",
+        "/science/LSAR/GSLC/metadata/sourceData/processingInformation/parameters/frequencyA/slantRange",
+        "/science/LSAR/identification/productSpecificationVersion",
+        "/science/LSAR/identification/productVersion",
+        "/science/LSAR/identification/zeroDopplerEndTime",
+        "/science/LSAR/identification/zeroDopplerStartTime",
+        "/science/LSAR/identification/boundingPolygon",
+        "/science/LSAR/identification/missionId",
+        "/science/LSAR/identification/lookDirection",
+        "/science/LSAR/identification/trackNumber",
+        "/science/LSAR/identification/orbitPassDirection",
+        "/science/LSAR/identification/absoluteOrbitNumber",
+        "/science/LSAR/GSLC/metadata/orbit/orbitType",
+    ]
 
-        # from ._orbit_cache import _copy_orbit_from_npz_cache, _read_path_under_root
+    copied_count = 0
 
-        dsets_to_copy = [
-            "/science/LSAR/GSLC/metadata/sourceData/swaths/frequencyA/centerFrequency",
-            "/science/LSAR/GSLC/metadata/sourceData/processingInformation/parameters/frequencyA/slantRange",
-            "/science/LSAR/identification/productSpecificationVersion",
-            "/science/LSAR/identification/productVersion",
-            "/science/LSAR/identification/zeroDopplerEndTime",
-            "/science/LSAR/identification/zeroDopplerStartTime",
-            "/science/LSAR/identification/boundingPolygon",
-            "/science/LSAR/identification/missionId",
-            "/science/LSAR/identification/lookDirection",
-            "/science/LSAR/identification/trackNumber",
-            "/science/LSAR/identification/orbitPassDirection",
-            "/science/LSAR/identification/absoluteOrbitNumber",
-            "/science/LSAR/GSLC/metadata/orbit/orbitType",
-        ]
+    # 1. Gather individual metadata parameters via GDAL Multidim API
+    ds = gdal.OpenEx(str(opera_cslc_file), gdal.OF_MULTIDIM_RASTER)
+    if ds is None:
+        logger.error(f"Could not open source file {opera_cslc_file} via GDAL Multidim")
+        raise IOError(f"Failed to access source file: {opera_cslc_file}")
 
-        orbit_group_path = "/science/LSAR/GSLC/metadata/orbit"
-        copied_count = 0
+    root_group = ds.GetRootGroup()
+    if root_group is None:
+        gdal_err = gdal.GetLastErrorMsg()
+        logger.error(f"Could not open root group for dataset. GDAL Error: {gdal_err}")
+        ds = None
+        raise IOError("Failed to parse root directory layout of source file.")
 
-        # 1. Gather individual metadata parameters via GDAL Multidim API
-        ds = gdal.OpenEx(str(opera_cslc_file), gdal.OF_MULTIDIM_RASTER)
-        if ds is None:
-            logger.error(
-                f"Could not open source file {opera_cslc_file} via GDAL Multidim"
-            )
-            raise IOError(f"Failed to access source file: {opera_cslc_file}")
+    try:
+        with h5py.File(output_hdf5_file, "a") as dst:
+            # 2. Extract standard scalar and array metadata fields
+            for dset_path in dsets_to_copy:
+                try:
+                    data = _read_path_under_root(root_group, dset_path)
+                except Exception as e:
+                    logger.debug(f"Skipping parameter read for {dset_path}: {e}")
+                    continue
 
-        root_group = ds.GetRootGroup()
-        if root_group is None:
-            gdal_err = gdal.GetLastErrorMsg()
-            logger.error(
-                f"Could not open root group for dataset. GDAL Error: {gdal_err}"
-            )
-            ds = None
-            raise IOError("Failed to parse root directory layout of source file.")
+                if data is None:
+                    continue
 
-        try:
-            with h5py.File(output_hdf5_file, "a") as dst:
-                # 2. Extract standard scalar and array metadata fields
-                for dset_path in dsets_to_copy:
-                    try:
-                        # Uses your existing _read_path_under_root helper logic
-                        data = _read_path_under_root(root_group, dset_path)
-                    except Exception as e:
-                        logger.debug(f"Skipping parameter read for {dset_path}: {e}")
-                        continue
+                out_group = str(Path(dset_path).parent)
+                dst.require_group(out_group)
 
-                    if data is None:
-                        continue
+                dset_name = Path(dset_path).name
+                full_path = f"{out_group}/{dset_name}"
 
-                    out_group = str(Path(dset_path).parent)
-                    dst.require_group(out_group)
+                if full_path in dst:
+                    del dst[full_path]
 
-                    dset_name = Path(dset_path).name
-                    full_path = f"{out_group}/{dset_name}"
-
-                    if full_path in dst:
-                        del dst[full_path]
-
-                    try:
-                        if isinstance(data, str):
-                            dst.create_dataset(full_path, data=np.bytes_(data))
-                        elif isinstance(data, (list, np.ndarray)):
-                            dst.create_dataset(full_path, data=np.array(data))
-                        else:
-                            dst.create_dataset(full_path, data=data)
-                        copied_count += 1
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed writing dataset to destination path {full_path}: {e}"
-                        )
-
-                # 3. Pull heavy orbit arrays out of the local binary cache (.npz) if provided
-                if cache_dir is not None and cache_dir.exists():
-                    orbit_copied = _copy_orbit_from_npz_cache(
-                        cache_dir=cache_dir,
-                        cslc_filename=opera_cslc_file,
-                        dst_h5=dst,
-                        orbit_group_path=orbit_group_path,
-                    )
-                    if not orbit_copied:
-                        logger.warning(
-                            "Orbit data was not appended to target compressed file."
-                        )
-                else:
+                try:
+                    if isinstance(data, str):
+                        dst.create_dataset(full_path, data=np.bytes_(data))
+                    elif isinstance(data, (list, np.ndarray)):
+                        dst.create_dataset(full_path, data=np.array(data))
+                    else:
+                        dst.create_dataset(full_path, data=data)
+                    copied_count += 1
+                except Exception as e:
                     logger.warning(
-                        "No valid cache directory supplied; skipping orbit extraction block."
+                        f"Failed writing dataset to destination path {full_path}: {e}"
                     )
 
-        finally:
-            # Explicit garbage collection sequence to spin down streaming connections cleanly
-            root_group = None
-            ds = None
+            # 3. Copy the orbit arrays directly from the staged source file.
+            if not _copy_orbit_from_source(opera_cslc_file, dst):
+                logger.warning(
+                    "Orbit data was not appended to target compressed file."
+                )
 
-        logger.info(
-            f"Metadata transfer complete. Wrote {copied_count} fields via GDAL "
-            f"into destination file: {output_hdf5_file}"
-        )
+    finally:
+        # Explicit garbage collection sequence to spin down streaming connections cleanly
+        root_group = None
+        ds = None
+
+    logger.info(
+        f"Metadata transfer complete. Wrote {copied_count} fields via GDAL "
+        f"into destination file: {output_hdf5_file}"
+    )
 
 
 def copy_cslc_metadata_to_displacement(
@@ -856,29 +870,19 @@ def copy_cslc_metadata_to_displacement(
                 except Exception as e:
                     logger.warning(f"Failed writing common field to {full_path}: {e}")
 
-            # 2. Extract and format both orbit datasets from the local .npz directory
-            if cache_dir is not None and cache_dir.exists():
-                # Process Reference Orbit Stack
-                _copy_orbit_from_npz_cache(
-                    cache_dir=cache_dir,
-                    cslc_filename=reference_cslc_file,
-                    dst_h5=dst,
-                    orbit_group_base_path=orbit_base_group,
-                    prepend_str="reference_",
-                )
-
-                # Process Secondary Orbit Stack
-                _copy_orbit_from_npz_cache(
-                    cache_dir=cache_dir,
-                    cslc_filename=secondary_cslc_file,
-                    dst_h5=dst,
-                    orbit_group_base_path=orbit_base_group,
-                    prepend_str="secondary_",
-                )
-            else:
-                logger.warning(
-                    "Cache directory not found or invalid; skipping orbit ingestion."
-                )
+            # 2. Read both orbit stacks directly from the (local) staged files.
+            _copy_orbit_from_source(
+                reference_cslc_file,
+                dst_h5=dst,
+                orbit_group_base_path=orbit_base_group,
+                prepend_str="reference_",
+            )
+            _copy_orbit_from_source(
+                secondary_cslc_file,
+                dst_h5=dst,
+                orbit_group_base_path=orbit_base_group,
+                prepend_str="secondary_",
+            )
 
     finally:
         # Clear handles to close streaming pipelines cleanly
