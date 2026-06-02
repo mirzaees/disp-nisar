@@ -17,7 +17,9 @@ from dolphin.interferogram import estimate_correlation_from_phase
 from dolphin.unwrap import grow_conncomp_snaphu
 from dolphin.utils import full_suffix
 from dolphin.workflows.config import UnwrapOptions
-from opera_utils._cslc import _get_dset_and_attrs, _read_nisar_projection_wkt
+from opera_utils._cslc import _get_dset_and_attrs
+
+from disp_nisar._mdarray import _read_nisar_projection_wkt
 from shapely.geometry import LinearRing, MultiPolygon, Polygon
 from tqdm.contrib.concurrent import thread_map
 

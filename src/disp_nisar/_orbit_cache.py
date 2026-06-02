@@ -19,7 +19,7 @@ import h5py
 import numpy as np
 from dolphin._types import Filename
 from opera_utils import get_orbit_arrays, get_zero_doppler_time, parse_filename
-from opera_utils._cslc import _read_mdarray_value, _read_string_mdarray
+from disp_nisar._mdarray import _read_mdarray_value, _read_string_mdarray
 
 try:
     from osgeo import gdal
