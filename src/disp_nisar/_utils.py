@@ -299,6 +299,58 @@ def _convert_meters_to_radians(
     return output_files
 
 
+def _unmangle_url(s: str) -> str:
+    """Restore the ``//`` that ``pathlib.Path`` collapses after a URL scheme.
+
+    ``Path("https://host/x")`` stringifies to ``"https:/host/x"`` (single
+    slash). Inputs flow through ``List[Path]``, so remote GSLC URLs arrive
+    mangled. This re-inserts the second slash for ``http(s)://`` and ``s3://``.
+    """
+    for scheme in ("https", "http", "s3"):
+        prefix = f"{scheme}:/"
+        if s.startswith(prefix) and not s.startswith(f"{scheme}://"):
+            return f"{scheme}://" + s[len(prefix) :]
+    return s
+
+
+def _is_remote_url(s: str) -> bool:
+    return s.startswith(("http://", "https://", "s3://"))
+
+
+@functools.lru_cache(maxsize=256)
+def _read_nisar_bbox_streamed_cached(
+    url: str, freq: str
+) -> tuple[int, tuple[float, float, float, float]] | None:
+    """Read EPSG + bounds from a remote NISAR GSLC by streaming it.
+
+    Uses opera-utils' ``open_h5`` (Earthdata/S3 auth via fsspec) so authenticated
+    ``https://`` / ``s3://`` URLs work where GDAL's HDF5 driver cannot open them.
+    """
+    try:
+        from opera_utils._remote import open_h5
+
+        with open_h5(url) as src:
+            grp = src[f"science/LSAR/GSLC/grids/frequency{freq}"]
+            epsg = int(grp["projection"][()])
+            x = grp["xCoordinates"][()]
+            y = grp["yCoordinates"][()]
+            x_spacing = float(grp["xCoordinateSpacing"][()])
+            y_spacing = float(grp["yCoordinateSpacing"][()])
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"_read_nisar_bbox_streamed_cached failed for {url}: {e}")
+        return None
+
+    hx = abs(x_spacing) / 2.0
+    hy = abs(y_spacing) / 2.0
+    bounds = (
+        float(x.min()) - hx,
+        float(y.min()) - hy,
+        float(x.max()) + hx,
+        float(y.max()) + hy,
+    )
+    return int(epsg), bounds
+
+
 def get_nisar_frame_bbox(
     cslc_file: Path,
     frequency: str = "frequencyA",
@@ -312,15 +364,19 @@ def get_nisar_frame_bbox(
     across polarizations within a frequency) and is kept for API
     compatibility.
     """
-    path = fspath(cslc_file)
+    path = _unmangle_url(fspath(cslc_file))
     ext = Path(path).suffix.lower()
 
     if ext in {".h5", ".hdf5"}:
         # Accept either "A"/"B" or "frequencyA"/"frequencyB"
         freq_short = frequency.removeprefix("frequency") or "A"
-        result = _read_nisar_bbox_multidim_cached(path, freq_short)
+        if _is_remote_url(path):
+            # Authenticated remote URL: GDAL's HDF5 driver can't open it; stream.
+            result = _read_nisar_bbox_streamed_cached(path, freq_short)
+        else:
+            result = _read_nisar_bbox_multidim_cached(path, freq_short)
         if result is None:
-            msg = f"Could not read EPSG/bbox from {cslc_file}"
+            msg = f"Could not read EPSG/bbox from {path}"
             raise RuntimeError(msg)
         epsg, bounds = result
         return epsg, Bbox(*bounds)
@@ -511,6 +567,14 @@ def _epsg_from_projection_mdarray(proj_ar) -> int | None:
 
 def _frequency_to_wavelength(frequency: str, gslc_file: Filename) -> float:
     dset = f"/science/LSAR/GSLC/grids/{frequency}/centerFrequency"
-    center_frequency = _get_dset_and_attrs(filename=gslc_file, dset_name=dset)[0]
+    url = _unmangle_url(fspath(gslc_file))
+    if _is_remote_url(url):
+        # Stream centerFrequency from the authenticated remote URL.
+        from opera_utils._remote import open_h5
+
+        with open_h5(url) as src:
+            center_frequency = float(src[dset][()])
+    else:
+        center_frequency = _get_dset_and_attrs(filename=gslc_file, dset_name=dset)[0]
     wavelength = SPEED_OF_LIGHT / center_frequency
     return wavelength

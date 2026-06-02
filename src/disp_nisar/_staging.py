@@ -94,6 +94,10 @@ def stage_inputs_to_local(
     # Imported lazily: pulls in the remote-streaming extras (aiohttp/fsspec/s3fs).
     from opera_utils.nisar._download import process_file
 
+    # `List[Path]` collapses the `//` after a URL scheme (https://... -> https:/...);
+    # restore it before handing URLs to the streaming reader.
+    from disp_nisar._utils import _unmangle_url
+
     frequency, polarization = parse_frequency_and_polarization(subdataset)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -106,7 +110,7 @@ def stage_inputs_to_local(
             staged.append(Path(str(src)))
             continue
         out = process_file(
-            url=str(src),
+            url=_unmangle_url(str(src)),
             rows=None,
             cols=None,
             output_dir=out_dir,
