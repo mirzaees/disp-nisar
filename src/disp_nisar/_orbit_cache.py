@@ -19,7 +19,6 @@ import h5py
 import numpy as np
 from dolphin._types import Filename
 from opera_utils import get_orbit_arrays, get_zero_doppler_time, parse_filename
-from disp_nisar._mdarray import _read_mdarray_value, _read_string_mdarray
 
 try:
     from osgeo import gdal
@@ -31,6 +30,94 @@ except ImportError:
     osr = None
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# GDAL multidim (MDArray) read helpers.
+#
+# These were previously private helpers in ``opera_utils._cslc``
+# (``_read_mdarray_value`` / ``_read_string_mdarray``) that were removed from
+# opera-utils; they are inlined here. They use GDAL's multidimensional raster
+# API, which reads local files and remote ``/vsis3/`` / ``/vsicurl/`` URLs.
+#
+# GDAL 3.10 note: string MDArrays raise ``RuntimeError`` from ``ReadAsArray()``
+# ("String buffer data type not supported in SWIG bindings") and must be read
+# via ``MDArray.Read()`` (returns a list of strings). Numeric arrays use
+# ``ReadAsArray()``.
+# ---------------------------------------------------------------------------
+def _decode_mdarray(value):
+    """Decode bytes/bytearray to str; unwrap single-element lists."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if len(value) == 1 else list(value)
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return value
+
+
+def _read_mdarray_value(ar):
+    """Read a GDAL MDArray and return a Python scalar / str / ndarray (or None)."""
+    if ar is None:
+        return None
+    try:
+        is_string = ar.GetDataType().GetClass() == gdal.GEDTC_STRING
+    except Exception:
+        is_string = False
+    if is_string:
+        try:
+            return _decode_mdarray(ar.Read())
+        except Exception:
+            return None
+    try:
+        arr = ar.ReadAsArray()
+    except Exception:
+        try:
+            return _decode_mdarray(ar.Read())
+        except Exception:
+            return None
+    if arr is None:
+        return None
+    if getattr(arr, "size", None) == 1:
+        return arr.reshape(-1)[0].item()
+    return arr
+
+
+def _open_mdarray(root_group, dset_path: str):
+    """Walk ``dset_path`` from ``root_group`` and return the leaf MDArray (or None)."""
+    parts = [p for p in dset_path.split("/") if p]
+    if not parts:
+        return None
+    grp = root_group
+    for name in parts[:-1]:
+        grp = grp.OpenGroup(name)
+        if grp is None:
+            return None
+    return grp.OpenMDArray(parts[-1])
+
+
+def _read_string_mdarray(h5file: Filename, dset_path: str) -> str | None:
+    """Open ``h5file`` via GDAL multidim and read a string dataset at ``dset_path``.
+
+    Works for local paths and ``/vsis3/`` / ``/vsicurl/`` URLs. Returns ``None``
+    if GDAL is unavailable, the file cannot be opened, or the dataset is absent.
+    """
+    if not HAS_GDAL:
+        return None
+    ds = None
+    try:
+        ds = gdal.OpenEx(fspath(h5file), gdal.OF_MULTIDIM_RASTER)
+        if ds is None:
+            return None
+        ar = _open_mdarray(ds.GetRootGroup(), dset_path)
+        if ar is None:
+            return None
+        value = _read_mdarray_value(ar)
+        if value is None:
+            return None
+        if isinstance(value, list):
+            value = value[0] if value else None
+        return None if value is None else str(value)
+    finally:
+        ds = None
 
 # NISAR datasets to cache for product metadata
 # Note: We skip "/science/LSAR/GSLC/metadata/orbit" group since it has

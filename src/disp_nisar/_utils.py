@@ -18,8 +18,6 @@ from dolphin.unwrap import grow_conncomp_snaphu
 from dolphin.utils import full_suffix
 from dolphin.workflows.config import UnwrapOptions
 from opera_utils._cslc import _get_dset_and_attrs
-
-from disp_nisar._mdarray import _read_nisar_projection_wkt
 from shapely.geometry import LinearRing, MultiPolygon, Polygon
 from tqdm.contrib.concurrent import thread_map
 
@@ -442,6 +440,36 @@ def _read_scalar_or(grp, name: str, fallback_arr) -> float | None:
                 return float(fallback_arr[1] - fallback_arr[0])
         except Exception:
             pass
+    return None
+
+
+def _read_nisar_projection_wkt(proj_ar) -> str | None:
+    """Return the projection WKT from a NISAR ``projection`` MDArray's attributes.
+
+    NISAR GSLC ``projection`` datasets carry the CRS WKT in a ``spatial_ref``
+    (or ``crs_wkt``) attribute. Returns ``None`` if no WKT attribute is found.
+    Inlined here (previously ``opera_utils._cslc._read_nisar_projection_wkt``,
+    since removed from opera-utils).
+    """
+    if proj_ar is None:
+        return None
+    for name in ("spatial_ref", "crs_wkt", "projection_wkt"):
+        try:
+            attr = proj_ar.GetAttribute(name)
+        except Exception:
+            attr = None
+        if attr is None:
+            continue
+        try:
+            value = attr.Read()
+        except Exception:
+            continue
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        if isinstance(value, (bytes, bytearray)):
+            value = bytes(value).decode("utf-8", "replace")
+        if value:
+            return str(value)
     return None
 
 
