@@ -300,16 +300,27 @@ def _convert_meters_to_radians(
 
 
 def _unmangle_url(s: str) -> str:
-    """Restore the ``//`` that ``pathlib.Path`` collapses after a URL scheme.
+    """Recover a remote URL that was damaged by passing through ``pathlib.Path``.
 
-    ``Path("https://host/x")`` stringifies to ``"https:/host/x"`` (single
-    slash). Inputs flow through ``List[Path]``, so remote GSLC URLs arrive
-    mangled. This re-inserts the second slash for ``http(s)://`` and ``s3://``.
+    Remote GSLC inputs flow through ``List[Path]`` and dolphin's path
+    resolution, which mangles them two ways:
+
+    * ``Path("https://host/x")`` collapses the ``//`` -> ``"https:/host/x"``;
+    * because the result no longer starts with ``/``, it is then treated as a
+      *relative* path and joined onto a base dir, e.g.
+      ``"/scratch/data/https:/host/x"``.
+
+    This finds an embedded ``http(s):/`` / ``s3:/`` scheme anywhere in the
+    string, strips everything before it, and restores the ``//``. Plain local
+    paths (no scheme) are returned unchanged.
     """
+    s = str(s)
     for scheme in ("https", "http", "s3"):
-        prefix = f"{scheme}:/"
-        if s.startswith(prefix) and not s.startswith(f"{scheme}://"):
-            return f"{scheme}://" + s[len(prefix) :]
+        marker = f"{scheme}:/"
+        idx = s.find(marker)
+        if idx != -1:
+            rest = s[idx + len(marker) :].lstrip("/")
+            return f"{scheme}://{rest}"
     return s
 
 
