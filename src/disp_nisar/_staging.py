@@ -70,8 +70,14 @@ def stage_inputs_to_local(
     cslc_file_list: Sequence[Filename],
     subdataset: str | None,
     out_dir: Path,
+    max_workers: int = 1,
+    compression: str | None = "gzip",
+    compression_opts: int | None = 1,
 ) -> list[Path]:
     """Repack each remote/local GSLC once into a compact local HDF5.
+
+    Files are staged concurrently (network-I/O bound), and each raster is copied
+    in row blocks so peak memory stays bounded even with several workers.
 
     Parameters
     ----------
@@ -82,6 +88,13 @@ def stage_inputs_to_local(
         Determines which frequency/polarization layer is extracted.
     out_dir : Path
         Directory for the staged compact HDF5 files.
+    max_workers : int
+        Number of files to stage concurrently (thread pool). Default 1.
+    compression : str | None
+        HDF5 compression for the staged raster. Default ``"gzip"``.
+    compression_opts : int | None
+        gzip level. Default 1 (fast; far cheaper than the level-4 default while
+        still shrinking the scratch file).
 
     Returns
     -------
@@ -102,22 +115,44 @@ def stage_inputs_to_local(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    staged: list[Path] = []
-    for src in cslc_file_list:
+    # Pre-size the output so results land back in input order regardless of the
+    # order workers finish in. Pass-through entries are filled immediately.
+    staged: list[Path | None] = [None] * len(cslc_file_list)
+    repack_indices: list[int] = []
+    for i, src in enumerate(cslc_file_list):
         if _is_compressed(src) or not _is_nisar_hdf5(src):
             # Compressed SLCs are GTiffs without a NISAR group hierarchy; other
             # non-HDF5 inputs (e.g. test fixtures) are passed through untouched.
-            staged.append(Path(str(src)))
-            continue
+            staged[i] = Path(str(src))
+        else:
+            repack_indices.append(i)
+
+    def _repack(i: int) -> tuple[int, Path]:
         out = process_file(
-            url=_unmangle_url(str(src)),
+            url=_unmangle_url(str(cslc_file_list[i])),
             rows=None,
             cols=None,
             output_dir=out_dir,
             frequency=frequency,
             polarizations=[polarization],
+            compression=compression,
+            compression_opts=compression_opts,
         )
-        staged.append(out)
+        return i, out
+
+    n_workers = max(1, min(max_workers, len(repack_indices)))
+    if n_workers == 1:
+        for i in repack_indices:
+            _, staged[i] = _repack(i)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        logger.info(
+            "Staging %d remote/HDF5 inputs with %d workers", len(repack_indices), n_workers
+        )
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for i, out in ex.map(_repack, repack_indices):
+                staged[i] = out
 
     logger.info(
         "Staged %d inputs to %s (frequency=%s, polarization=%s)",
@@ -126,7 +161,7 @@ def stage_inputs_to_local(
         frequency,
         polarization,
     )
-    return staged
+    return [p for p in staged if p is not None]
 
 
 def build_frame_nodata_mask(

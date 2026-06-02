@@ -206,10 +206,12 @@ def _stage_and_prepare_inputs(
     worker settings in :meth:`RunConfig.to_workflow`.
     """
     # Stage every input once into a compact local HDF5 (required layers only).
+    # Stage files concurrently (network-bound) using the configured worker count.
     staged = stage_inputs_to_local(
         cfg.cslc_file_list,
         subdataset=cfg.input_options.subdataset,
         out_dir=cfg.work_directory / "staged_inputs",
+        max_workers=max(1, cfg.worker_settings.n_parallel_bursts),
     )
     cfg.cslc_file_list = staged
 
